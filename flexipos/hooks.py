@@ -86,7 +86,8 @@ app_license = "mit"
 # ------------
 
 # before_install = "flexipos.install.before_install"
-# after_install = "flexipos.install.after_install"
+after_install = "flexipos.api.setup_custom_fields"
+after_migrate = "flexipos.api.setup_custom_fields"
 
 # Uninstallation
 # ------------
