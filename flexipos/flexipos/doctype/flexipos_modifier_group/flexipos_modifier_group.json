@@ -1,0 +1,98 @@
+{
+ "actions": [],
+ "autoname": "field:group_name",
+ "creation": "2026-07-08 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "group_name",
+  "flexipos_company",
+  "column_break_1",
+  "selection_type",
+  "required",
+  "min_select",
+  "max_select",
+  "options"
+ ],
+ "fields": [
+  {
+   "fieldname": "group_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Group Name",
+   "reqd": 1,
+   "unique": 1
+  },
+  {
+   "description": "Item is a global master; groups are namespaced per business so two tenants can both have a \"Size\" group.",
+   "fieldname": "flexipos_company",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Business",
+   "options": "Company",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "Single",
+   "fieldname": "selection_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Selection Type",
+   "options": "Single\nMultiple",
+   "reqd": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "required",
+   "fieldtype": "Check",
+   "in_list_view": 1,
+   "label": "Required"
+  },
+  {
+   "depends_on": "eval:doc.selection_type=='Multiple'",
+   "description": "Leave at 0 for no limit.",
+   "fieldname": "min_select",
+   "fieldtype": "Int",
+   "label": "Minimum Selections"
+  },
+  {
+   "depends_on": "eval:doc.selection_type=='Multiple'",
+   "description": "Leave at 0 for no limit.",
+   "fieldname": "max_select",
+   "fieldtype": "Int",
+   "label": "Maximum Selections"
+  },
+  {
+   "fieldname": "options",
+   "fieldtype": "Table",
+   "label": "Options",
+   "options": "FlexiPOS Modifier Option",
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-08 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Modifier Group",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "print": 0,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": []
+}

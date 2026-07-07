@@ -4,7 +4,15 @@ Whitelisted endpoints consumed by the FlexiPOS Flutter client.
 
 Every endpoint returns a plain JSON-serialisable dict. Business data is
 mapped onto standard ERPNext DocTypes (Company, Branch, POS Profile,
-Item, Item Price, Sales Invoice) — no custom DocTypes.
+Item, Item Price, Sales Invoice) wherever possible. Two deliberate
+exceptions to the "no custom DocTypes" default:
+  - "FlexiPOS OTP": new-device login codes.
+  - "FlexiPOS Modifier Group" / "FlexiPOS Modifier Option" (child) /
+    "FlexiPOS Item Modifier Group" (child, on Item): item modifiers
+    with real group semantics (single/multiple choice, required,
+    min/max) — the old model (add-ons as plain Items pointing at a
+    parent) had no way to express "choose 1 of N" or "required", so it
+    was replaced rather than layered on top of.
 
 Custom Fields used (created by `setup_custom_fields`, wire it into
 hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
@@ -16,6 +24,8 @@ hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
     Company.flexipos_phone
     User.flexipos_pin_hash
     User.flexipos_device_id
+    Item.flexipos_company
+    Item.flexipos_modifier_groups (Table → FlexiPOS Item Modifier Group)
 """
 
 import base64
@@ -50,11 +60,12 @@ DEVICE_ID_FIELD = "flexipos_device_id"
 # Item is a GLOBAL master in ERPNext (no company column), so FlexiPOS
 # stamps every item with its owning company and filters all reads on it.
 COMPANY_FIELD = "flexipos_company"
-# Add-ons/modifiers are ordinary Items pointing at their parent product,
-# so a sold add-on is just another Sales Invoice line — accounting stays
-# exact with no custom transaction model.
-PARENT_FIELD = "flexipos_parent_item"
-ADDON_GROUP = "Add-ons"
+# Modifiers (e.g. "Size: Small/Medium/Large", "Add-ons: Extra Cheese +150")
+# live in FlexiPOS Modifier Group/Option, reused across items via the
+# Item.flexipos_modifier_groups child table. A chosen modifier has no
+# item_code of its own — its price is folded into the Sales Invoice
+# line's rate and its label appended to the line's description.
+MODIFIER_GROUPS_FIELD = "flexipos_modifier_groups"
 # Stock ERPNext Item Group has no dependable image field, so category
 # photos live in our own Attach Image custom field.
 CATEGORY_IMAGE_FIELD = "flexipos_image"
@@ -148,12 +159,10 @@ def setup_custom_fields():
                     "insert_after": "item_group",
                 },
                 {
-                    "fieldname": PARENT_FIELD,
-                    "label": "FlexiPOS Parent Item",
-                    "fieldtype": "Data",
-                    "read_only": 1,
-                    "no_copy": 1,
-                    "search_index": 1,
+                    "fieldname": MODIFIER_GROUPS_FIELD,
+                    "label": "FlexiPOS Modifier Groups",
+                    "fieldtype": "Table",
+                    "options": "FlexiPOS Item Modifier Group",
                     "insert_after": COMPANY_FIELD,
                 },
             ],
@@ -551,10 +560,52 @@ def sync_inventory(last_sync_datetime=None):
             "disabled",
             "modified",
             "description",
-            PARENT_FIELD,
         ],
         limit_page_length=0,
     )
+    if items:
+        item_codes = [i.item_code for i in items]
+        links = frappe.get_all(
+            "FlexiPOS Item Modifier Group",
+            filters={"parent": ("in", item_codes), "parenttype": "Item"},
+            fields=["parent", "modifier_group"],
+            order_by="idx",
+        )
+        groups_by_item = {}
+        for link in links:
+            groups_by_item.setdefault(link.parent, []).append(link.modifier_group)
+        for item in items:
+            item["modifier_groups"] = groups_by_item.get(item.item_code, [])
+
+    # Every modifier group belonging to the business, with its options —
+    # items reference groups by name, so the client resolves the join
+    # locally instead of re-sending the group payload per item.
+    modifier_groups = []
+    group_names = frappe.get_all(
+        "FlexiPOS Modifier Group",
+        filters={"flexipos_company": company},
+        pluck="name",
+    )
+    for name in group_names:
+        group = frappe.get_cached_doc("FlexiPOS Modifier Group", name)
+        modifier_groups.append(
+            {
+                "name": group.name,
+                "group_name": group.group_name,
+                "selection_type": group.selection_type,
+                "required": group.required,
+                "min_select": group.min_select,
+                "max_select": group.max_select,
+                "options": [
+                    {
+                        "label": o.label,
+                        "price": flt(o.price),
+                        "is_default": o.is_default,
+                    }
+                    for o in group.options
+                ],
+            }
+        )
 
     prices = []
     company_item_codes = frappe.get_all(
@@ -599,6 +650,7 @@ def sync_inventory(last_sync_datetime=None):
         "items": items,
         "prices": prices,
         "categories": categories,
+        "modifier_groups": modifier_groups,
     }
 
 
@@ -618,7 +670,10 @@ def save_item(item_json):
           "category": "Drinks",       # Item Group, created if missing
           "uom": "Nos",
           "track_stock": 0,           # default off: micro-retailers first
-          "disabled": 0
+          "disabled": 0,
+          "modifier_groups": ["Size", "Add-ons"]   # names of groups this
+                                                     # item offers; omit to
+                                                     # leave unchanged
         }
 
     Returns the same row shape sync_inventory uses (plus price) so the
@@ -683,11 +738,12 @@ def save_item(item_json):
 
     _set_selling_price(item.name, price)
 
-    # "addons" present (even empty) → reconcile; absent → leave alone.
-    addon_rows = None
-    if data.get("addons") is not None:
-        addon_rows = _save_addons(item.name, company, data["addons"])
+    # "modifier_groups" present (even empty) → replace the item's group
+    # list; absent → leave whatever is already assigned alone.
+    if data.get("modifier_groups") is not None:
+        _assign_modifier_groups(item, company, data["modifier_groups"])
 
+    item.reload()
     return {
         "item_code": item.name,
         "item_name": item.item_name,
@@ -698,66 +754,157 @@ def save_item(item_json):
         "disabled": item.disabled,
         "modified": str(item.modified),
         "price": price,
-        "addons": addon_rows or [],
+        "modifier_groups": [g.modifier_group for g in item.get(MODIFIER_GROUPS_FIELD)],
     }
 
 
-def _save_addons(parent_code, company, addons):
-    """Reconcile a product's add-ons: the payload is the full desired
-    list; add-ons no longer present are disabled (never deleted — they
-    may appear on past invoices)."""
-    if not isinstance(addons, list):
-        frappe.throw(_("addons must be a list"))
+def _assign_modifier_groups(item, company, group_names):
+    """Replace the item's modifier-group assignments. `group_names` is
+    the full desired list of FlexiPOS Modifier Group names (must already
+    belong to this business — assign_modifier_groups doesn't create
+    groups, use save_modifier_group for that)."""
+    if not isinstance(group_names, list):
+        frappe.throw(_("modifier_groups must be a list"))
 
-    group = _ensure_item_group(ADDON_GROUP)
-    kept, rows = set(), []
-    for addon in addons:
-        if not isinstance(addon, dict):
-            continue
-        name = (addon.get("name") or addon.get("item_name") or "").strip()
-        if not name:
-            continue
-        price = flt(addon.get("price"))
-        code = (addon.get("item_code") or "").strip()
-
-        if code and frappe.db.get_value("Item", code, COMPANY_FIELD) == company:
-            doc = frappe.get_doc("Item", code)
-            doc.item_name = name
-            doc.disabled = 0
-            doc.flags.ignore_permissions = True
-            doc.save()
-        else:
-            doc = frappe.get_doc(
-                {
-                    "doctype": "Item",
-                    "item_code": _make_item_code(company, name),
-                    "item_name": name,
-                    "item_group": group,
-                    "stock_uom": "Nos",
-                    "is_stock_item": 0,
-                    "is_sales_item": 1,
-                    COMPANY_FIELD: company,
-                    PARENT_FIELD: parent_code,
-                }
+    for name in group_names:
+        owner = frappe.db.get_value("FlexiPOS Modifier Group", name, "flexipos_company")
+        if owner is None:
+            frappe.throw(_("Modifier group {0} does not exist").format(name))
+        if owner != company:
+            frappe.throw(
+                _("Modifier group {0} belongs to another business").format(name),
+                frappe.PermissionError,
             )
-            doc.insert(ignore_permissions=True)
 
-        _set_selling_price(doc.name, price)
-        kept.add(doc.name)
-        rows.append(
-            {"item_code": doc.name, "item_name": doc.item_name, "price": price}
+    item.set(MODIFIER_GROUPS_FIELD, [{"modifier_group": name} for name in group_names])
+    item.flags.ignore_permissions = True
+    item.save()
+
+
+@frappe.whitelist()
+def save_modifier_group(group_json):
+    """Create or update a reusable modifier group for the caller's
+    business (e.g. "Size" with Small/Medium/Large, or "Add-ons" with
+    Extra Cheese/No Onions).
+
+    Payload:
+        {
+          "name": "Size",             # present → update, absent → create
+          "group_name": "Size",
+          "selection_type": "Single", # "Single" | "Multiple"
+          "required": 1,
+          "min_select": 0,
+          "max_select": 0,
+          "options": [
+            {"label": "Small", "price": 0, "is_default": 1},
+            {"label": "Large", "price": 50}
+          ]
+        }
+    """
+    data = group_json
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            frappe.throw(_("group_json is not valid JSON"))
+    if not isinstance(data, dict):
+        frappe.throw(_("Expected a modifier group object"))
+
+    company = _get_user_company()
+
+    group_name = (data.get("group_name") or "").strip()
+    if not group_name:
+        frappe.throw(_("Group name is required"))
+    selection_type = data.get("selection_type") or "Single"
+    if selection_type not in ("Single", "Multiple"):
+        frappe.throw(_("selection_type must be Single or Multiple"))
+    options = data.get("options") or []
+    if not isinstance(options, list) or not options:
+        frappe.throw(_("At least one option is required"))
+
+    option_rows = []
+    for opt in options:
+        if not isinstance(opt, dict):
+            continue
+        label = (opt.get("label") or "").strip()
+        if not label:
+            continue
+        option_rows.append(
+            {
+                "label": label,
+                "price": flt(opt.get("price")),
+                "is_default": cint(opt.get("is_default")),
+            }
+        )
+    if not option_rows:
+        frappe.throw(_("At least one option is required"))
+
+    existing_name = (data.get("name") or "").strip()
+    if existing_name:
+        owner = frappe.db.get_value(
+            "FlexiPOS Modifier Group", existing_name, "flexipos_company"
+        )
+        if owner != company:
+            frappe.throw(
+                _("This modifier group belongs to another business"),
+                frappe.PermissionError,
+            )
+        group = frappe.get_doc("FlexiPOS Modifier Group", existing_name)
+        group.group_name = group_name
+    else:
+        group = frappe.new_doc("FlexiPOS Modifier Group")
+        group.group_name = group_name
+        group.flexipos_company = company
+
+    group.selection_type = selection_type
+    group.required = cint(data.get("required"))
+    group.min_select = cint(data.get("min_select"))
+    group.max_select = cint(data.get("max_select"))
+    group.set("options", option_rows)
+    group.flags.ignore_permissions = True
+    group.save()
+
+    return {
+        "name": group.name,
+        "group_name": group.group_name,
+        "selection_type": group.selection_type,
+        "required": group.required,
+        "min_select": group.min_select,
+        "max_select": group.max_select,
+        "options": [
+            {"label": o.label, "price": flt(o.price), "is_default": o.is_default}
+            for o in group.options
+        ],
+    }
+
+
+@frappe.whitelist()
+def delete_modifier_group(name):
+    """Remove a modifier group. Fails loudly if any item still
+    references it — the caller should unassign it from those items
+    first (past invoices are unaffected either way, since a chosen
+    modifier is baked into the invoice line's rate/description, not a
+    live reference)."""
+    company = _get_user_company()
+    owner = frappe.db.get_value("FlexiPOS Modifier Group", name, "flexipos_company")
+    if owner is None:
+        frappe.throw(_("Modifier group {0} does not exist").format(name))
+    if owner != company:
+        frappe.throw(
+            _("This modifier group belongs to another business"),
+            frappe.PermissionError,
         )
 
-    stale = frappe.get_all(
-        "Item",
-        filters={PARENT_FIELD: parent_code, COMPANY_FIELD: company, "disabled": 0},
-        pluck="name",
+    in_use = frappe.get_all(
+        "FlexiPOS Item Modifier Group",
+        filters={"modifier_group": name, "parenttype": "Item"},
+        limit=1,
     )
-    for code in stale:
-        if code not in kept:
-            frappe.db.set_value("Item", code, "disabled", 1)
+    if in_use:
+        frappe.throw(_("Remove this group from its items before deleting it"))
 
-    return rows
+    frappe.delete_doc("FlexiPOS Modifier Group", name, ignore_permissions=True)
+    return {"deleted": name}
 
 
 @frappe.whitelist()
@@ -902,9 +1049,21 @@ def push_offline_invoices(invoices_json):
           "pos_profile": "My Shop POS",            # optional, resolved if absent
           "customer": "Walk-in Customer",          # optional
           "posting_datetime": "2026-07-05 14:03:22",
-          "items": [{"item_code": "X", "qty": 2, "rate": 150.0}],
+          "items": [
+            {
+              "item_code": "X",
+              "qty": 2,
+              "rate": 150.0,          # unit price INCLUDING chosen modifiers
+              "modifiers": [{"group": "Size", "label": "Large", "price": 50}]
+            }
+          ],
           "payments": [{"mode_of_payment": "Cash", "amount": 300.0}]
         }
+
+    Modifiers have no item_code of their own (see module docstring) — the
+    client resolves the chosen options' prices into `rate` itself, and
+    `modifiers` here is carried through only to annotate the invoice
+    line's description for the kitchen ticket/receipt.
 
     Small batches are processed inline so the client gets a per-invoice
     result immediately; large batches are queued to a background worker
@@ -1060,6 +1219,17 @@ def _create_pos_invoice(payload, offline_id):
         doc.branch = payload["branch"]
 
     for row in items:
+        modifiers = row.get("modifiers") or []
+        description = (
+            ", ".join(
+                f"{m.get('label')}"
+                + (f" (+{flt(m.get('price'))})" if flt(m.get("price")) else "")
+                for m in modifiers
+                if isinstance(m, dict) and m.get("label")
+            )
+            if modifiers
+            else None
+        )
         doc.append(
             "items",
             {
@@ -1068,6 +1238,7 @@ def _create_pos_invoice(payload, offline_id):
                 "rate": flt(row.get("rate")),
                 "uom": row.get("uom"),
                 "warehouse": profile.warehouse,
+                **({"description": description} if description else {}),
             },
         )
 
