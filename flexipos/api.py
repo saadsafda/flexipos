@@ -57,6 +57,11 @@ KITCHEN_STATUS_FIELD = "flexipos_kitchen_status"
 KITCHEN_STATUSES = ["Placed", "Preparing", "Ready", "Served"]
 PIN_HASH_FIELD = "flexipos_pin_hash"
 DEVICE_ID_FIELD = "flexipos_device_id"
+# Freeform (not a Select) since the sensible role set differs per business
+# type (Chef/Waiter for a restaurant, Pharmacist/Cashier for a pharmacy,
+# etc.) — see the Team & Roles screen's per-niche default suggestions.
+ROLE_FIELD = "flexipos_role"
+ADMIN_ROLE = "Admin"
 # Item is a GLOBAL master in ERPNext (no company column), so FlexiPOS
 # stamps every item with its owning company and filters all reads on it.
 COMPANY_FIELD = "flexipos_company"
@@ -189,6 +194,13 @@ def setup_custom_fields():
                     "fieldtype": "Data",
                     "no_copy": 1,
                     "insert_after": PIN_HASH_FIELD,
+                },
+                {
+                    "fieldname": ROLE_FIELD,
+                    "label": "FlexiPOS Role",
+                    "fieldtype": "Data",
+                    "no_copy": 1,
+                    "insert_after": DEVICE_ID_FIELD,
                 },
             ],
         },
@@ -508,6 +520,11 @@ def _link_current_user(company):
     for role in ("Sales User", "Accounts User", "Stock User"):
         if role not in existing_roles and frappe.db.exists("Role", role):
             user_doc.append("roles", {"role": role})
+    # The user completing onboarding owns the business, so they are its
+    # Admin — set explicitly rather than leaving flexipos_role empty,
+    # so Team & Roles has one unambiguous source of truth for who can
+    # manage staff.
+    user_doc.set(ROLE_FIELD, ADMIN_ROLE)
     user_doc.flags.ignore_permissions = True
     user_doc.save()
 
@@ -1294,6 +1311,241 @@ def update_kitchen_status(invoice_name, status):
 
 
 # ---------------------------------------------------------------------------
+# 3b. Refunds
+# ---------------------------------------------------------------------------
+# Line-item precise refunds map onto ERPNext's standard Credit Note
+# mechanism (Sales Invoice with is_return=1, return_against=<original>,
+# negative quantities) — no custom refund/transaction DocType needed.
+# The refund always returns to the original invoice's tender (the new
+# Sales Invoice Payment row reuses the same mode_of_payment), and the
+# reason is recorded in the credit note's remarks for the audit trail.
+
+@frappe.whitelist()
+def process_refund(invoice_name, items_json, reason=None):
+    """Refund one or more line items from a submitted Sales Invoice.
+
+    Payload:
+        invoice_name: "ACC-SINV-2026-00078"
+        items_json: [{"item_code": "X", "qty": 1}]   # qty being returned
+        reason: "Wrong item served"                    # optional, freeform
+
+    Returns the new credit note's name and the refunded amount. Fails
+    if the invoice belongs to another business, isn't submitted, or a
+    requested item/qty exceeds what was actually sold (accounting for
+    any prior partial refunds against the same invoice).
+    """
+    items = items_json
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except json.JSONDecodeError:
+            frappe.throw(_("items_json is not valid JSON"))
+    if not isinstance(items, list) or not items:
+        frappe.throw(_("Select at least one item to refund"))
+
+    company = _get_user_company()
+    original = frappe.get_doc("Sales Invoice", invoice_name)
+    if original.company != company:
+        frappe.throw(_("This order belongs to another business"), frappe.PermissionError)
+    if original.docstatus != 1:
+        frappe.throw(_("Only submitted orders can be refunded"))
+    if original.is_return:
+        frappe.throw(_("This is already a credit note"))
+
+    sold_qty = {row.item_code: flt(row.qty) for row in original.items}
+    already_refunded = _refunded_qty_by_item(invoice_name)
+
+    return_rows = []
+    for row in items:
+        if not isinstance(row, dict):
+            continue
+        item_code = (row.get("item_code") or "").strip()
+        qty = flt(row.get("qty"))
+        if not item_code or qty <= 0:
+            continue
+        available = sold_qty.get(item_code, 0) - already_refunded.get(item_code, 0)
+        if qty > available:
+            frappe.throw(
+                _("Cannot refund {0} of {1} — only {2} left to refund").format(
+                    qty, item_code, available
+                )
+            )
+        return_rows.append((item_code, qty))
+
+    if not return_rows:
+        frappe.throw(_("Select at least one item to refund"))
+
+    credit_note = frappe.new_doc("Sales Invoice")
+    credit_note.update(
+        {
+            "company": original.company,
+            "customer": original.customer,
+            "is_pos": original.is_pos,
+            "pos_profile": original.pos_profile,
+            "is_return": 1,
+            "return_against": original.name,
+            "set_posting_time": 1,
+            "posting_date": now_datetime().date(),
+            "posting_time": now_datetime().time(),
+            "update_stock": original.update_stock,
+            "selling_price_list": original.selling_price_list,
+            "remarks": f"Refund — {reason.strip()}" if reason and reason.strip() else "Refund",
+            ORDER_TYPE_FIELD: original.get(ORDER_TYPE_FIELD),
+            TABLE_FIELD: original.get(TABLE_FIELD),
+        }
+    )
+
+    original_rows = {row.item_code: row for row in original.items}
+    refund_total = 0.0
+    for item_code, qty in return_rows:
+        source_row = original_rows[item_code]
+        credit_note.append(
+            "items",
+            {
+                "item_code": item_code,
+                "qty": -qty,
+                "rate": flt(source_row.rate),
+                "uom": source_row.uom,
+                "warehouse": source_row.warehouse,
+                "description": source_row.description,
+            },
+        )
+        refund_total += flt(source_row.rate) * qty
+
+    credit_note.set_missing_values()
+    credit_note.run_method("calculate_taxes_and_totals")
+
+    original_tender = (
+        original.payments[0].mode_of_payment if original.payments else "Cash"
+    )
+    credit_note.set("payments", [])
+    credit_note.append(
+        "payments",
+        {"mode_of_payment": original_tender, "amount": flt(credit_note.grand_total)},
+    )
+
+    credit_note.flags.ignore_permissions = True
+    credit_note.insert()
+    credit_note.submit()
+
+    return {
+        "credit_note": credit_note.name,
+        "refund_amount": flt(-credit_note.grand_total),
+        "tender": original_tender,
+    }
+
+
+def _refunded_qty_by_item(invoice_name):
+    """Sum of already-refunded quantities per item across every credit
+    note issued against this invoice, so repeated partial refunds can't
+    together exceed what was sold."""
+    credit_notes = frappe.get_all(
+        "Sales Invoice",
+        filters={"return_against": invoice_name, "docstatus": 1, "is_return": 1},
+        pluck="name",
+    )
+    if not credit_notes:
+        return {}
+    rows = frappe.get_all(
+        "Sales Invoice Item",
+        filters={"parent": ("in", credit_notes)},
+        fields=["item_code", "qty"],
+    )
+    totals = {}
+    for row in rows:
+        # Credit note quantities are stored negative; flip sign for a
+        # positive "amount already refunded" tally.
+        totals[row.item_code] = totals.get(row.item_code, 0) - flt(row.qty)
+    return totals
+
+
+@frappe.whitelist()
+def get_order_history(limit=100):
+    """Recent submitted orders for the caller's business, newest first,
+    with refund status derived from any credit notes against them —
+    for the Order History & Refunds screen."""
+    company = _get_user_company()
+    invoices = frappe.get_all(
+        "Sales Invoice",
+        filters={"company": company, "docstatus": 1, "is_return": 0},
+        fields=[
+            "name",
+            "posting_date",
+            "posting_time",
+            "grand_total",
+            "customer",
+            TABLE_FIELD,
+            ORDER_TYPE_FIELD,
+        ],
+        order_by="posting_date desc, posting_time desc",
+        limit_page_length=cint(limit),
+    )
+    if not invoices:
+        return {"orders": []}
+
+    names = [inv.name for inv in invoices]
+    item_rows = frappe.get_all(
+        "Sales Invoice Item",
+        filters={"parent": ("in", names)},
+        fields=["parent", "item_code", "item_name", "qty", "rate"],
+    )
+    items_by_invoice = {}
+    for row in item_rows:
+        items_by_invoice.setdefault(row.parent, []).append(
+            {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": flt(row.qty),
+                "rate": flt(row.rate),
+            }
+        )
+
+    payment_rows = frappe.get_all(
+        "Sales Invoice Payment",
+        filters={"parent": ("in", names)},
+        fields=["parent", "mode_of_payment"],
+    )
+    tender_by_invoice = {row.parent: row.mode_of_payment for row in payment_rows}
+
+    credit_notes = frappe.get_all(
+        "Sales Invoice",
+        filters={"return_against": ("in", names), "docstatus": 1, "is_return": 1},
+        fields=["return_against", "grand_total"],
+    )
+    refunded_by_invoice = {}
+    for cn in credit_notes:
+        refunded_by_invoice[cn.return_against] = refunded_by_invoice.get(
+            cn.return_against, 0
+        ) + abs(flt(cn.grand_total))
+
+    orders = []
+    for inv in invoices:
+        refunded = refunded_by_invoice.get(inv.name, 0)
+        if refunded <= 0:
+            status = "paid"
+        elif refunded >= flt(inv.grand_total):
+            status = "refunded"
+        else:
+            status = "partial"
+        orders.append(
+            {
+                "name": inv.name,
+                "posting_date": str(inv.posting_date),
+                "posting_time": str(inv.posting_time),
+                "grand_total": flt(inv.grand_total),
+                "customer": inv.customer,
+                "table_no": inv.get(TABLE_FIELD),
+                "order_type": inv.get(ORDER_TYPE_FIELD),
+                "tender": tender_by_invoice.get(inv.name, "Cash"),
+                "items": items_by_invoice.get(inv.name, []),
+                "refund_status": status,
+                "refunded_amount": refunded,
+            }
+        )
+    return {"orders": orders}
+
+
+# ---------------------------------------------------------------------------
 # 4. PIN login
 # ---------------------------------------------------------------------------
 
@@ -1368,6 +1620,182 @@ def verify_pin_login(pin, device_id):
 
 def _hash_pin(pin, salt):
     return hashlib.pbkdf2_hmac("sha256", pin.encode(), salt.encode(), 60_000).hex()
+
+
+# ---------------------------------------------------------------------------
+# 4b. Team & roles (admin-only staff management)
+# ---------------------------------------------------------------------------
+# Staff are ordinary Frappe Users scoped to the business via the same
+# User Permission mechanism used everywhere else for tenant isolation —
+# no custom "Staff" DocType. Role is a freeform label (flexipos_role)
+# rather than a Frappe Role, since it's just a display/grouping concept
+# today (e.g. "Chef", "Waiter") and not yet wired to real permission
+# scoping — see the memory note on this being a UI-first pass.
+
+@frappe.whitelist()
+def list_staff():
+    """Every staff member linked to the caller's business, admin-only."""
+    _ensure_custom_fields()
+    company = _get_user_company()
+    _require_admin(company)
+
+    user_names = frappe.get_all(
+        "User Permission",
+        filters={"allow": "Company", "for_value": company},
+        pluck="user",
+    )
+    if not user_names:
+        return {"staff": []}
+
+    rows = frappe.get_all(
+        "User",
+        filters={"name": ("in", user_names)},
+        fields=["name", "full_name", "email", ROLE_FIELD, DEVICE_ID_FIELD, "enabled", "last_active"],
+        order_by="full_name",
+    )
+    return {
+        "staff": [
+            {
+                "user": r.name,
+                "full_name": r.full_name,
+                "email": r.email,
+                "role": r.get(ROLE_FIELD) or ADMIN_ROLE,
+                "has_device": bool(r.get(DEVICE_ID_FIELD)),
+                "enabled": r.enabled,
+                "last_active": str(r.last_active) if r.last_active else None,
+                "is_you": r.name == frappe.session.user,
+            }
+            for r in rows
+        ]
+    }
+
+
+@frappe.whitelist()
+def add_staff(full_name, role, pin, email=None):
+    """Create a new staff account under the caller's business and bind
+    a PIN for it immediately (the admin sets it on the staff member's
+    behalf, e.g. handing them a freshly configured device)."""
+    _ensure_custom_fields()
+    company = _get_user_company()
+    _require_admin(company)
+
+    full_name = (full_name or "").strip()
+    role = (role or "").strip()
+    pin = (pin or "").strip()
+    if not full_name:
+        frappe.throw(_("Name is required"))
+    if not role:
+        frappe.throw(_("Role is required"))
+    if not pin.isdigit() or not 4 <= len(pin) <= 6:
+        frappe.throw(_("PIN must be 4-6 digits"))
+
+    email = (email or "").strip().lower()
+    if not email:
+        # Staff without email/password sign in via PIN only; Frappe
+        # still needs a unique "email" identity, so synthesize one from
+        # the company + name (never surfaced in the app's UI).
+        slug = frappe.scrub(f"{company}-{full_name}")[:60]
+        email = f"{slug}@staff.flexipos.local"
+        candidate, counter = email, 1
+        while frappe.db.exists("User", candidate):
+            counter += 1
+            candidate = f"{slug}{counter}@staff.flexipos.local"
+        email = candidate
+    elif frappe.db.exists("User", email):
+        frappe.throw(_("An account with {0} already exists").format(email))
+
+    salt = secrets.token_hex(16)
+    user = frappe.get_doc(
+        {
+            "doctype": "User",
+            "email": email,
+            "first_name": full_name,
+            "user_type": "System User",
+            "send_welcome_email": 0,
+            ROLE_FIELD: role,
+            PIN_HASH_FIELD: f"{salt}${_hash_pin(pin, salt)}",
+        }
+    )
+    user.flags.no_welcome_mail = True
+    user.insert(ignore_permissions=True)
+
+    for frappe_role in ("Sales User", "Accounts User", "Stock User"):
+        if frappe.db.exists("Role", frappe_role):
+            user.append("roles", {"role": frappe_role})
+    user.flags.ignore_permissions = True
+    user.save()
+
+    frappe.get_doc(
+        {
+            "doctype": "User Permission",
+            "user": user.name,
+            "allow": "Company",
+            "for_value": company,
+        }
+    ).insert(ignore_permissions=True)
+
+    return {"user": user.name, "full_name": user.full_name, "role": role}
+
+
+@frappe.whitelist()
+def update_staff(user, full_name=None, role=None, new_pin=None):
+    """Admin edits an existing staff member: rename, change role, and/or
+    reset their PIN (including the admin's own — device binding is left
+    untouched so a PIN reset doesn't kick them off their current device
+    unless they also re-register it)."""
+    _ensure_custom_fields()
+    company = _get_user_company()
+    _require_admin(company)
+    _require_staff_of_company(user, company)
+
+    updates = {}
+    if full_name and full_name.strip():
+        updates["first_name"] = full_name.strip()
+    if role and role.strip():
+        updates[ROLE_FIELD] = role.strip()
+    if new_pin is not None and new_pin != "":
+        pin = new_pin.strip()
+        if not pin.isdigit() or not 4 <= len(pin) <= 6:
+            frappe.throw(_("PIN must be 4-6 digits"))
+        salt = secrets.token_hex(16)
+        updates[PIN_HASH_FIELD] = f"{salt}${_hash_pin(pin, salt)}"
+
+    if updates:
+        frappe.db.set_value("User", user, updates, update_modified=False)
+
+    return {"user": user}
+
+
+@frappe.whitelist()
+def remove_staff(user):
+    """Disable a staff member (never delete — past sales/audit trail
+    reference them). Cannot disable yourself."""
+    company = _get_user_company()
+    _require_admin(company)
+    _require_staff_of_company(user, company)
+    if user == frappe.session.user:
+        frappe.throw(_("You cannot remove your own account"))
+
+    frappe.db.set_value("User", user, "enabled", 0, update_modified=False)
+    return {"user": user, "enabled": False}
+
+
+def _require_admin(company):
+    """Only the business's Admin can manage staff. The very first user
+    (the one who ran register_business) always has ADMIN_ROLE implicitly
+    even if flexipos_role was never set, so onboarding doesn't lock
+    itself out."""
+    role = frappe.db.get_value("User", frappe.session.user, ROLE_FIELD)
+    if role and role != ADMIN_ROLE:
+        frappe.throw(_("Only an Admin can manage staff"), frappe.PermissionError)
+
+
+def _require_staff_of_company(user, company):
+    owner = frappe.db.get_value(
+        "User Permission", {"user": user, "allow": "Company"}, "for_value"
+    )
+    if owner != company:
+        frappe.throw(_("This staff member belongs to another business"), frappe.PermissionError)
 
 
 # ---------------------------------------------------------------------------
