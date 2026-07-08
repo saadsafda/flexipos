@@ -355,9 +355,11 @@ def get_my_business():
     business_type = frappe.db.get_value(
         "Company", profile.company, "flexipos_business_type"
     )
+    role = frappe.db.get_value("User", user, ROLE_FIELD)
     return {
         "company": profile.company,
         "business_type": business_type,
+        "role": role or ADMIN_ROLE,
         "pos_profile": profile.name,
         "customer": profile.customer,
         "currency": profile.currency,
@@ -1610,9 +1612,11 @@ def verify_pin_login(pin, device_id):
 
     frappe.cache().delete_value(cache_key)
     frappe.local.login_manager.login_as(user.name)
+    role = frappe.db.get_value("User", user.name, ROLE_FIELD)
     return {
         "user": user.name,
         "full_name": frappe.db.get_value("User", user.name, "full_name"),
+        "role": role or ADMIN_ROLE,
         "sid": frappe.session.sid,
         **_get_api_credentials(user.name),
     }
