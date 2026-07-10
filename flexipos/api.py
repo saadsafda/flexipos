@@ -45,7 +45,7 @@ from frappe.utils import (
 )
 
 DEFAULT_CURRENCY = "PKR"
-BUSINESS_TYPES = ["Restaurant", "Pharmacy", "Retail", "Service"]
+BUSINESS_TYPES = ["Restaurant", "Pharmacy", "Retail", "Service", "Clothing", "Bakery", "Other"]
 DEFAULT_COUNTRY = "Pakistan"
 DEFAULT_PRICE_LIST = "Standard Selling"
 WALK_IN_CUSTOMER = "Walk-in Customer"
