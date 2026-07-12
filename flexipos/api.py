@@ -7,12 +7,15 @@ mapped onto standard ERPNext DocTypes (Company, Branch, POS Profile,
 Item, Item Price, Sales Invoice) wherever possible. Two deliberate
 exceptions to the "no custom DocTypes" default:
   - "FlexiPOS OTP": new-device login codes.
-  - "FlexiPOS Modifier Group" / "FlexiPOS Modifier Option" (child) /
-    "FlexiPOS Item Modifier Group" (child, on Item): item modifiers
-    with real group semantics (single/multiple choice, required,
-    min/max) — the old model (add-ons as plain Items pointing at a
-    parent) had no way to express "choose 1 of N" or "required", so it
-    was replaced rather than layered on top of.
+  - "FlexiPOS Modifier" (master) / "FlexiPOS Modifier Group" /
+    "FlexiPOS Modifier Option" (child) / "FlexiPOS Item Modifier Group"
+    (child, on Item): item modifiers with real group semantics
+    (single/multiple choice, required, min/max) — the old model
+    (add-ons as plain Items pointing at a parent) had no way to express
+    "choose 1 of N" or "required", so it was replaced rather than
+    layered on top of. Each option row links a reusable FlexiPOS
+    Modifier master, so one modifier (e.g. "Extra Cheese") can appear
+    in any number of groups.
 
 Custom Fields used (created by `setup_custom_fields`, wire it into
 hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
@@ -26,6 +29,21 @@ hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
     User.flexipos_device_id
     Item.flexipos_company
     Item.flexipos_modifier_groups (Table → FlexiPOS Item Modifier Group)
+    Item.flexipos_requires_prescription (Pharmacy: Rx badge)
+    Item.flexipos_cold_chain (Pharmacy: cold-chain badge)
+    Item.flexipos_duration_minutes (Service duration / Restaurant prep time)
+    Item.flexipos_material (Clothing: fabric label)
+    Item.flexipos_season (Clothing: season/collection label)
+    Item.flexipos_gender (Clothing: Men/Women/Unisex/Kids)
+    Item.flexipos_variant_matrix (Clothing: size×colour stock matrix, JSON)
+    Item.flexipos_tax_rate (item tax %, stored per item)
+    Item.flexipos_stock_qty (simple on-hand count, not ledger stock)
+    Item.flexipos_dietary_flags (Restaurant: CSV, e.g. "Halal,Gluten-free")
+    Item.flexipos_recipe_depletion (Restaurant: recipe/BOM depletion flag)
+
+Barcodes reuse ERPNext's standard Item.barcodes child table (Item
+Barcode) rather than a new field — see sync_inventory/save_item/
+lookup_item_by_barcode.
 """
 
 import base64
@@ -66,14 +84,67 @@ ADMIN_ROLE = "Admin"
 # stamps every item with its owning company and filters all reads on it.
 COMPANY_FIELD = "flexipos_company"
 # Modifiers (e.g. "Size: Small/Medium/Large", "Add-ons: Extra Cheese +150")
-# live in FlexiPOS Modifier Group/Option, reused across items via the
-# Item.flexipos_modifier_groups child table. A chosen modifier has no
-# item_code of its own — its price is folded into the Sales Invoice
-# line's rate and its label appended to the line's description.
+# live in the FlexiPOS Modifier master, composed into groups via
+# FlexiPOS Modifier Option link rows (one master, many groups), and
+# reused across items via the Item.flexipos_modifier_groups child
+# table. A chosen modifier has no item_code of its own — its price is
+# folded into the Sales Invoice line's rate and its label appended to
+# the line's description.
 MODIFIER_GROUPS_FIELD = "flexipos_modifier_groups"
 # Stock ERPNext Item Group has no dependable image field, so category
 # photos live in our own Attach Image custom field.
 CATEGORY_IMAGE_FIELD = "flexipos_image"
+# Niche-specific item flags/badges — cosmetic in the POS UI, but real
+# per-item data (not hardcoded), so a business can turn them on/off per
+# product like any other field.
+RX_FIELD = "flexipos_requires_prescription"
+COLD_CHAIN_FIELD = "flexipos_cold_chain"
+DURATION_FIELD = "flexipos_duration_minutes"
+# Clothing niche. Material/season/gender are plain labels; the variant
+# matrix is one JSON blob per item:
+#   {"colours": [{"name": "Olive", "hex": "#6B7C3F"}, ...],
+#    "sizes": ["S", "M", "L", "XL"],
+#    "qty": {"Olive": {"S": 8, "M": 14, ...}, ...}}
+# Kept on the template item (no per-variant Item rows) because FlexiPOS
+# items default to is_stock_item=0 — there is no stock ledger to feed.
+# The POS variant picker reads colours/sizes straight from this blob.
+MATERIAL_FIELD = "flexipos_material"
+SEASON_FIELD = "flexipos_season"
+GENDER_FIELD = "flexipos_gender"
+VARIANT_MATRIX_FIELD = "flexipos_variant_matrix"
+GENDER_OPTIONS = ["Men", "Women", "Unisex", "Kids"]
+# Item tax % shown on receipts-to-be: stored per item and synced, but not
+# yet folded into Sales Invoice taxes (needs a Sales Taxes and Charges
+# row + client-side receipt math — its own project).
+TAX_RATE_FIELD = "flexipos_tax_rate"
+# Simple on-hand count typed by the merchant. NOT ledger stock — items
+# stay is_stock_item=0, same reasoning as the clothing variant matrix.
+STOCK_QTY_FIELD = "flexipos_stock_qty"
+# Restaurant: CSV of dietary badges ("Halal,Gluten-free") and whether the
+# dish should eventually deplete ingredient stock via a recipe/BOM (the
+# flag is persisted now; BOM consumption is future work).
+DIETARY_FIELD = "flexipos_dietary_flags"
+RECIPE_DEPLETION_FIELD = "flexipos_recipe_depletion"
+GENERIC_NAME_FIELD = "flexipos_generic_name"
+BRAND_NAME_FIELD = "flexipos_brand_name"
+BATCH_NO_FIELD = "flexipos_batch_no"
+EXPIRY_DATE_FIELD = "flexipos_expiry_date"
+DOSAGE_FORM_FIELD = "flexipos_dosage_form"
+RACK_BIN_FIELD = "flexipos_rack_bin"
+REORDER_POINT_FIELD = "flexipos_reorder_point"
+DEPARTMENT_FIELD = "flexipos_department"
+SHELF_LOCATION_FIELD = "flexipos_shelf_location"
+SUPPLIER_FIELD = "flexipos_supplier"
+PACK_SIZE_FIELD = "flexipos_pack_size"
+REORDER_QTY_FIELD = "flexipos_reorder_qty"
+LOW_STOCK_ALERT_FIELD = "flexipos_low_stock_alert"
+SHELF_LIFE_FIELD = "flexipos_shelf_life"
+LEAD_TIME_FIELD = "flexipos_lead_time"
+ALLERGENS_FIELD = "flexipos_allergens"
+DEFAULT_SIZE_FIELD = "flexipos_default_size"
+ALLOW_CUSTOM_MESSAGE_FIELD = "flexipos_allow_custom_message"
+MADE_TO_ORDER_FIELD = "flexipos_made_to_order"
+DIETARY_OPTIONS = ["Halal", "Vegetarian", "Vegan", "Gluten-free", "Nut-free", "Spicy"]
 
 ALLOWED_IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp")
 MAX_IMAGE_BYTES = 3 * 1024 * 1024
@@ -170,6 +241,96 @@ def setup_custom_fields():
                     "options": "FlexiPOS Item Modifier Group",
                     "insert_after": COMPANY_FIELD,
                 },
+                {
+                    "fieldname": RX_FIELD,
+                    "label": "Requires Prescription",
+                    "fieldtype": "Check",
+                    "default": "0",
+                    "insert_after": MODIFIER_GROUPS_FIELD,
+                },
+                {
+                    "fieldname": COLD_CHAIN_FIELD,
+                    "label": "Cold Chain",
+                    "fieldtype": "Check",
+                    "default": "0",
+                    "insert_after": RX_FIELD,
+                },
+                {
+                    "fieldname": DURATION_FIELD,
+                    "label": "Duration (Minutes)",
+                    "fieldtype": "Int",
+                    "insert_after": COLD_CHAIN_FIELD,
+                },
+                {
+                    "fieldname": MATERIAL_FIELD,
+                    "label": "Material",
+                    "fieldtype": "Data",
+                    "insert_after": DURATION_FIELD,
+                },
+                {
+                    "fieldname": SEASON_FIELD,
+                    "label": "Season",
+                    "fieldtype": "Data",
+                    "insert_after": MATERIAL_FIELD,
+                },
+                {
+                    "fieldname": GENDER_FIELD,
+                    "label": "Gender",
+                    "fieldtype": "Select",
+                    "options": "\n" + "\n".join(GENDER_OPTIONS),
+                    "insert_after": SEASON_FIELD,
+                },
+                {
+                    "fieldname": VARIANT_MATRIX_FIELD,
+                    "label": "Variant Matrix (JSON)",
+                    "fieldtype": "Long Text",
+                    "hidden": 1,
+                    "insert_after": GENDER_FIELD,
+                },
+                {
+                    "fieldname": TAX_RATE_FIELD,
+                    "label": "Tax Rate (%)",
+                    "fieldtype": "Percent",
+                    "insert_after": VARIANT_MATRIX_FIELD,
+                },
+                {
+                    "fieldname": STOCK_QTY_FIELD,
+                    "label": "Stock Qty (simple count)",
+                    "fieldtype": "Int",
+                    "insert_after": TAX_RATE_FIELD,
+                },
+                {
+                    "fieldname": DIETARY_FIELD,
+                    "label": "Dietary Flags",
+                    "fieldtype": "Data",
+                    "insert_after": STOCK_QTY_FIELD,
+                },
+                {
+                    "fieldname": RECIPE_DEPLETION_FIELD,
+                    "label": "Recipe-based Depletion",
+                    "fieldtype": "Check",
+                    "default": "0",
+                    "insert_after": DIETARY_FIELD,
+                },
+                {"fieldname": GENERIC_NAME_FIELD, "label": "Generic Name", "fieldtype": "Data", "insert_after": RECIPE_DEPLETION_FIELD},
+                {"fieldname": BRAND_NAME_FIELD, "label": "Brand Name", "fieldtype": "Data", "insert_after": GENERIC_NAME_FIELD},
+                {"fieldname": BATCH_NO_FIELD, "label": "Batch / Lot No.", "fieldtype": "Data", "insert_after": BRAND_NAME_FIELD},
+                {"fieldname": EXPIRY_DATE_FIELD, "label": "Expiry Date", "fieldtype": "Data", "insert_after": BATCH_NO_FIELD},
+                {"fieldname": DOSAGE_FORM_FIELD, "label": "Dosage Form", "fieldtype": "Data", "insert_after": EXPIRY_DATE_FIELD},
+                {"fieldname": RACK_BIN_FIELD, "label": "Rack / Bin", "fieldtype": "Data", "insert_after": DOSAGE_FORM_FIELD},
+                {"fieldname": REORDER_POINT_FIELD, "label": "Reorder Point", "fieldtype": "Int", "insert_after": RACK_BIN_FIELD},
+                {"fieldname": DEPARTMENT_FIELD, "label": "Department", "fieldtype": "Data", "insert_after": REORDER_POINT_FIELD},
+                {"fieldname": SHELF_LOCATION_FIELD, "label": "Shelf Location", "fieldtype": "Data", "insert_after": DEPARTMENT_FIELD},
+                {"fieldname": SUPPLIER_FIELD, "label": "Supplier", "fieldtype": "Data", "insert_after": SHELF_LOCATION_FIELD},
+                {"fieldname": PACK_SIZE_FIELD, "label": "Pack / Case Size", "fieldtype": "Data", "insert_after": SUPPLIER_FIELD},
+                {"fieldname": REORDER_QTY_FIELD, "label": "Reorder Qty", "fieldtype": "Int", "insert_after": PACK_SIZE_FIELD},
+                {"fieldname": LOW_STOCK_ALERT_FIELD, "label": "Low-stock Alert", "fieldtype": "Check", "default": "0", "insert_after": REORDER_QTY_FIELD},
+                {"fieldname": SHELF_LIFE_FIELD, "label": "Shelf Life", "fieldtype": "Data", "insert_after": LOW_STOCK_ALERT_FIELD},
+                {"fieldname": LEAD_TIME_FIELD, "label": "Lead Time", "fieldtype": "Data", "insert_after": SHELF_LIFE_FIELD},
+                {"fieldname": ALLERGENS_FIELD, "label": "Allergens", "fieldtype": "Data", "insert_after": LEAD_TIME_FIELD},
+                {"fieldname": DEFAULT_SIZE_FIELD, "label": "Default Size", "fieldtype": "Data", "insert_after": ALLERGENS_FIELD},
+                {"fieldname": ALLOW_CUSTOM_MESSAGE_FIELD, "label": "Allow Custom Message", "fieldtype": "Check", "default": "0", "insert_after": DEFAULT_SIZE_FIELD},
+                {"fieldname": MADE_TO_ORDER_FIELD, "label": "Made to Order", "fieldtype": "Check", "default": "0", "insert_after": ALLOW_CUSTOM_MESSAGE_FIELD},
             ],
             "Item Group": [
                 {
@@ -222,10 +383,10 @@ def _ensure_custom_fields():
     """Create the custom fields on first use if the site hasn't been
     migrated yet. Custom Field writes need admin rights, and the caller
     may be Guest (self-serve signup) — so elevate just for this step."""
-    # Sales Invoice.flexipos_order_type is the newest field; if it
-    # exists, all the older ones do too (they are created together).
+    # Item.flexipos_reorder_point is the newest field; if it exists,
+    # all the older ones do too (they are created together).
     if frappe.db.exists(
-        "Custom Field", {"dt": "Sales Invoice", "fieldname": ORDER_TYPE_FIELD}
+        "Custom Field", {"dt": "Item", "fieldname": MADE_TO_ORDER_FIELD}
     ):
         return
     original_user = frappe.session.user
@@ -579,6 +740,25 @@ def sync_inventory(last_sync_datetime=None):
             "disabled",
             "modified",
             "description",
+            "valuation_rate",
+            RX_FIELD,
+            COLD_CHAIN_FIELD,
+            DURATION_FIELD,
+            MATERIAL_FIELD,
+            SEASON_FIELD,
+            GENDER_FIELD,
+            VARIANT_MATRIX_FIELD,
+            TAX_RATE_FIELD,
+            STOCK_QTY_FIELD,
+            DIETARY_FIELD,
+            RECIPE_DEPLETION_FIELD,
+            GENERIC_NAME_FIELD, BRAND_NAME_FIELD, BATCH_NO_FIELD,
+            EXPIRY_DATE_FIELD, DOSAGE_FORM_FIELD, RACK_BIN_FIELD,
+            REORDER_POINT_FIELD,
+            DEPARTMENT_FIELD, SHELF_LOCATION_FIELD, SUPPLIER_FIELD,
+            PACK_SIZE_FIELD, REORDER_QTY_FIELD, LOW_STOCK_ALERT_FIELD,
+            SHELF_LIFE_FIELD, LEAD_TIME_FIELD, ALLERGENS_FIELD,
+            DEFAULT_SIZE_FIELD, ALLOW_CUSTOM_MESSAGE_FIELD, MADE_TO_ORDER_FIELD,
         ],
         limit_page_length=0,
     )
@@ -595,6 +775,21 @@ def sync_inventory(last_sync_datetime=None):
             groups_by_item.setdefault(link.parent, []).append(link.modifier_group)
         for item in items:
             item["modifier_groups"] = groups_by_item.get(item.item_code, [])
+
+        # One primary barcode per item (the first row in its Item Barcode
+        # child table) — enough for scan-to-add lookups without exposing
+        # ERPNext's multi-barcode-per-UOM feature to the client.
+        barcode_rows = frappe.get_all(
+            "Item Barcode",
+            filters={"parent": ("in", item_codes), "parenttype": "Item"},
+            fields=["parent", "barcode"],
+            order_by="parent, idx",
+        )
+        barcode_by_item = {}
+        for row in barcode_rows:
+            barcode_by_item.setdefault(row.parent, row.barcode)
+        for item in items:
+            item["barcode"] = barcode_by_item.get(item.item_code)
 
     # Every modifier group belonging to the business, with its options —
     # items reference groups by name, so the client resolves the join
@@ -617,6 +812,7 @@ def sync_inventory(last_sync_datetime=None):
                 "max_select": group.max_select,
                 "options": [
                     {
+                        "modifier": o.modifier,
                         "label": o.label,
                         "price": flt(o.price),
                         "is_default": o.is_default,
@@ -690,6 +886,25 @@ def save_item(item_json):
           "uom": "Nos",
           "track_stock": 0,           # default off: micro-retailers first
           "disabled": 0,
+          "barcode": "6291041234567",  # omit to leave unchanged, "" to clear
+          "requires_prescription": 0,  # Pharmacy: Rx badge
+          "cold_chain": 0,             # Pharmacy: cold-chain badge
+          "duration_minutes": 30,      # Service duration / Restaurant prep
+          "sku": "CL-2210",            # create only: item_code becomes
+                                       # "<company abbr>-CL-2210"
+          "cost_price": 60,            # Item.valuation_rate
+          "tax_rate": 5,               # item tax %, stored (not yet applied
+                                       # to invoice totals)
+          "stock_qty": 40,             # simple on-hand count, not ledger
+          "dietary_flags": ["Halal"],  # Restaurant (list or CSV string)
+          "recipe_depletion": 1,       # Restaurant: recipe/BOM flag
+          "material": "100% Linen",    # Clothing
+          "season": "SS26",            # Clothing
+          "gender": "Unisex",          # Clothing: Men/Women/Unisex/Kids
+          "variant_matrix": {...},     # Clothing size×colour stock matrix
+                                       # (see VARIANT_MATRIX_FIELD comment);
+                                       # omit to leave unchanged, null/{} to
+                                       # clear
           "modifier_groups": ["Size", "Add-ons"]   # names of groups this
                                                      # item offers; omit to
                                                      # leave unchanged
@@ -724,6 +939,7 @@ def save_item(item_json):
 
     item_group = _ensure_item_group(category)
     item_code = (data.get("item_code") or "").strip()
+    barcode = (data.get("barcode") or "").strip() or None
 
     if item_code:
         owner = frappe.db.get_value("Item", item_code, COMPANY_FIELD)
@@ -737,25 +953,105 @@ def save_item(item_json):
         item.item_group = item_group
         item.description = description
         item.disabled = cint(data.get("disabled"))
+        if "requires_prescription" in data:
+            item.set(RX_FIELD, cint(data.get("requires_prescription")))
+        if "cold_chain" in data:
+            item.set(COLD_CHAIN_FIELD, cint(data.get("cold_chain")))
+        if "duration_minutes" in data:
+            item.set(DURATION_FIELD, cint(data.get("duration_minutes")) or None)
+        if "cost_price" in data:
+            item.valuation_rate = flt(data.get("cost_price"))
+        if "material" in data:
+            item.set(MATERIAL_FIELD, (data.get("material") or "").strip())
+        if "season" in data:
+            item.set(SEASON_FIELD, (data.get("season") or "").strip())
+        if "gender" in data:
+            item.set(GENDER_FIELD, _clean_gender(data.get("gender")))
+        if "variant_matrix" in data:
+            item.set(VARIANT_MATRIX_FIELD, _clean_variant_matrix(data.get("variant_matrix")))
+        if "tax_rate" in data:
+            item.set(TAX_RATE_FIELD, flt(data.get("tax_rate")))
+        if "stock_qty" in data:
+            item.set(STOCK_QTY_FIELD, max(cint(data.get("stock_qty")), 0))
+        if "dietary_flags" in data:
+            item.set(DIETARY_FIELD, _clean_dietary_flags(data.get("dietary_flags")))
+        if "recipe_depletion" in data:
+            item.set(RECIPE_DEPLETION_FIELD, cint(data.get("recipe_depletion")))
+        for key, field in (("generic_name", GENERIC_NAME_FIELD), ("brand_name", BRAND_NAME_FIELD), ("batch_no", BATCH_NO_FIELD), ("expiry_date", EXPIRY_DATE_FIELD), ("dosage_form", DOSAGE_FORM_FIELD), ("rack_bin", RACK_BIN_FIELD)):
+            if key in data:
+                item.set(field, (data.get(key) or "").strip())
+        if "reorder_point" in data:
+            item.set(REORDER_POINT_FIELD, max(cint(data.get("reorder_point")), 0))
+        for key, field in (("department", DEPARTMENT_FIELD), ("shelf_location", SHELF_LOCATION_FIELD), ("supplier", SUPPLIER_FIELD), ("pack_size", PACK_SIZE_FIELD)):
+            if key in data:
+                item.set(field, (data.get(key) or "").strip())
+        if "reorder_qty" in data:
+            item.set(REORDER_QTY_FIELD, max(cint(data.get("reorder_qty")), 0))
+        if "low_stock_alert" in data:
+            item.set(LOW_STOCK_ALERT_FIELD, cint(data.get("low_stock_alert")))
+        for key, field in (("shelf_life", SHELF_LIFE_FIELD), ("lead_time", LEAD_TIME_FIELD), ("allergens", ALLERGENS_FIELD), ("default_size", DEFAULT_SIZE_FIELD)):
+            if key in data:
+                item.set(field, (data.get(key) or "").strip())
+        if "allow_custom_message" in data:
+            item.set(ALLOW_CUSTOM_MESSAGE_FIELD, cint(data.get("allow_custom_message")))
+        if "made_to_order" in data:
+            item.set(MADE_TO_ORDER_FIELD, cint(data.get("made_to_order")))
         item.flags.ignore_permissions = True
         item.save()
     else:
+        sku = (data.get("sku") or "").strip()
         item = frappe.get_doc(
             {
                 "doctype": "Item",
-                "item_code": _make_item_code(company, item_name),
+                "item_code": _make_item_code(company, sku or item_name),
                 "item_name": item_name,
                 "item_group": item_group,
                 "description": description,
                 "stock_uom": uom,
                 "is_stock_item": cint(data.get("track_stock")),
                 "is_sales_item": 1,
+                "valuation_rate": flt(data.get("cost_price")),
                 COMPANY_FIELD: company,
+                RX_FIELD: cint(data.get("requires_prescription")),
+                COLD_CHAIN_FIELD: cint(data.get("cold_chain")),
+                DURATION_FIELD: cint(data.get("duration_minutes")) or None,
+                MATERIAL_FIELD: (data.get("material") or "").strip(),
+                SEASON_FIELD: (data.get("season") or "").strip(),
+                GENDER_FIELD: _clean_gender(data.get("gender")),
+                VARIANT_MATRIX_FIELD: _clean_variant_matrix(data.get("variant_matrix")),
+                TAX_RATE_FIELD: flt(data.get("tax_rate")),
+                STOCK_QTY_FIELD: max(cint(data.get("stock_qty")), 0),
+                DIETARY_FIELD: _clean_dietary_flags(data.get("dietary_flags")),
+                RECIPE_DEPLETION_FIELD: cint(data.get("recipe_depletion")),
+                GENERIC_NAME_FIELD: (data.get("generic_name") or "").strip(),
+                BRAND_NAME_FIELD: (data.get("brand_name") or "").strip(),
+                BATCH_NO_FIELD: (data.get("batch_no") or "").strip(),
+                EXPIRY_DATE_FIELD: (data.get("expiry_date") or "").strip(),
+                DOSAGE_FORM_FIELD: (data.get("dosage_form") or "").strip(),
+                RACK_BIN_FIELD: (data.get("rack_bin") or "").strip(),
+                REORDER_POINT_FIELD: max(cint(data.get("reorder_point")), 0),
+                DEPARTMENT_FIELD: (data.get("department") or "").strip(),
+                SHELF_LOCATION_FIELD: (data.get("shelf_location") or "").strip(),
+                SUPPLIER_FIELD: (data.get("supplier") or "").strip(),
+                PACK_SIZE_FIELD: (data.get("pack_size") or "").strip(),
+                REORDER_QTY_FIELD: max(cint(data.get("reorder_qty")), 0),
+                LOW_STOCK_ALERT_FIELD: cint(data.get("low_stock_alert")),
+                SHELF_LIFE_FIELD: (data.get("shelf_life") or "").strip(),
+                LEAD_TIME_FIELD: (data.get("lead_time") or "").strip(),
+                ALLERGENS_FIELD: (data.get("allergens") or "").strip(),
+                DEFAULT_SIZE_FIELD: (data.get("default_size") or "").strip(),
+                ALLOW_CUSTOM_MESSAGE_FIELD: cint(data.get("allow_custom_message")),
+                MADE_TO_ORDER_FIELD: cint(data.get("made_to_order")),
             }
         )
         item.insert(ignore_permissions=True)
 
     _set_selling_price(item.name, price)
+
+    # "barcode" present (even blank) → replace the item's primary barcode;
+    # absent (key missing) → leave whatever is already assigned alone.
+    if "barcode" in data:
+        _set_primary_barcode(item, barcode)
 
     # "modifier_groups" present (even empty) → replace the item's group
     # list; absent → leave whatever is already assigned alone.
@@ -773,8 +1069,129 @@ def save_item(item_json):
         "disabled": item.disabled,
         "modified": str(item.modified),
         "price": price,
+        "barcode": item.get("barcodes")[0].barcode if item.get("barcodes") else None,
+        "requires_prescription": item.get(RX_FIELD),
+        "cold_chain": item.get(COLD_CHAIN_FIELD),
+        "duration_minutes": item.get(DURATION_FIELD),
+        "cost_price": flt(item.valuation_rate),
+        "material": item.get(MATERIAL_FIELD),
+        "season": item.get(SEASON_FIELD),
+        "gender": item.get(GENDER_FIELD),
+        "variant_matrix": item.get(VARIANT_MATRIX_FIELD),
+        "tax_rate": flt(item.get(TAX_RATE_FIELD)),
+        "stock_qty": item.get(STOCK_QTY_FIELD),
+        "dietary_flags": item.get(DIETARY_FIELD),
+        "recipe_depletion": item.get(RECIPE_DEPLETION_FIELD),
+        "generic_name": item.get(GENERIC_NAME_FIELD),
+        "brand_name": item.get(BRAND_NAME_FIELD),
+        "batch_no": item.get(BATCH_NO_FIELD),
+        "expiry_date": item.get(EXPIRY_DATE_FIELD),
+        "dosage_form": item.get(DOSAGE_FORM_FIELD),
+        "rack_bin": item.get(RACK_BIN_FIELD),
+        "reorder_point": item.get(REORDER_POINT_FIELD),
+        "department": item.get(DEPARTMENT_FIELD),
+        "shelf_location": item.get(SHELF_LOCATION_FIELD),
+        "supplier": item.get(SUPPLIER_FIELD),
+        "pack_size": item.get(PACK_SIZE_FIELD),
+        "reorder_qty": item.get(REORDER_QTY_FIELD),
+        "low_stock_alert": item.get(LOW_STOCK_ALERT_FIELD),
+        "shelf_life": item.get(SHELF_LIFE_FIELD),
+        "lead_time": item.get(LEAD_TIME_FIELD),
+        "allergens": item.get(ALLERGENS_FIELD),
+        "default_size": item.get(DEFAULT_SIZE_FIELD),
+        "allow_custom_message": item.get(ALLOW_CUSTOM_MESSAGE_FIELD),
+        "made_to_order": item.get(MADE_TO_ORDER_FIELD),
         "modifier_groups": [g.modifier_group for g in item.get(MODIFIER_GROUPS_FIELD)],
     }
+
+
+def _clean_gender(value):
+    value = (value or "").strip().title()
+    return value if value in GENDER_OPTIONS else ""
+
+
+def _clean_dietary_flags(raw):
+    """Accept a list or CSV string; keep only known options, in the
+    canonical order, as a CSV string."""
+    if not raw:
+        return ""
+    parts = raw if isinstance(raw, list) else str(raw).split(",")
+    chosen = {str(p).strip().lower() for p in parts}
+    return ",".join(o for o in DIETARY_OPTIONS if o.lower() in chosen)
+
+
+def _clean_variant_matrix(raw):
+    """Validate and normalise the clothing size×colour matrix into the
+    canonical JSON shape (see VARIANT_MATRIX_FIELD) so the client can
+    trust whatever it syncs back. Returns None to clear the field."""
+    if not raw:
+        return None
+    data = raw
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            frappe.throw(_("variant_matrix is not valid JSON"))
+    if not isinstance(data, dict):
+        frappe.throw(_("variant_matrix must be an object"))
+
+    colours = []
+    seen = set()
+    for colour in data.get("colours") or []:
+        if not isinstance(colour, dict):
+            continue
+        name = (colour.get("name") or "").strip()[:40]
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        colours.append({"name": name, "hex": (colour.get("hex") or "").strip()[:9]})
+
+    sizes = []
+    for size in data.get("sizes") or []:
+        size = str(size).strip()[:20]
+        if size and size not in sizes:
+            sizes.append(size)
+
+    if not colours or not sizes:
+        return None
+
+    qty_in = data.get("qty") or {}
+    qty = {}
+    for colour in colours:
+        row = qty_in.get(colour["name"])
+        row = row if isinstance(row, dict) else {}
+        qty[colour["name"]] = {size: max(cint(row.get(size)), 0) for size in sizes}
+
+    return json.dumps({"colours": colours, "sizes": sizes, "qty": qty})
+
+
+def _set_primary_barcode(item, barcode):
+    """Replace the item's Item Barcode child table with a single row (or
+    clear it if `barcode` is falsy). FlexiPOS only ever shows/edits one
+    barcode per item, so this never has to merge with existing rows."""
+    item.set("barcodes", [{"barcode": barcode}] if barcode else [])
+    item.flags.ignore_permissions = True
+    item.save()
+
+
+@frappe.whitelist()
+def lookup_item_by_barcode(barcode):
+    """Scan-to-add: resolve a scanned/typed barcode to an item_code within
+    the caller's business. Returns None if no item has that barcode."""
+    company = _get_user_company()
+    barcode = (barcode or "").strip()
+    if not barcode:
+        return None
+
+    item_code = frappe.db.get_value(
+        "Item Barcode", {"barcode": barcode, "parenttype": "Item"}, "parent"
+    )
+    if not item_code:
+        return None
+    owner = frappe.db.get_value("Item", item_code, COMPANY_FIELD)
+    if owner != company:
+        return None
+    return {"item_code": item_code}
 
 
 def _assign_modifier_groups(item, company, group_names):
@@ -800,11 +1217,35 @@ def _assign_modifier_groups(item, company, group_names):
     item.save()
 
 
+def _get_or_create_modifier(company, modifier_name, default_price=0):
+    """Reuse the business's FlexiPOS Modifier of that name, creating it
+    on first use — the master's price only seeds new options (each
+    option row can override it)."""
+    existing = frappe.db.get_value(
+        "FlexiPOS Modifier",
+        {"modifier_name": modifier_name, "flexipos_company": company},
+    )
+    if existing:
+        return existing
+    modifier = frappe.new_doc("FlexiPOS Modifier")
+    modifier.modifier_name = modifier_name
+    modifier.flexipos_company = company
+    modifier.price = default_price
+    modifier.flags.ignore_permissions = True
+    modifier.insert()
+    return modifier.name
+
+
 @frappe.whitelist()
 def save_modifier_group(group_json):
     """Create or update a reusable modifier group for the caller's
     business (e.g. "Size" with Small/Medium/Large, or "Add-ons" with
     Extra Cheese/No Onions).
+
+    Each option row points at a FlexiPOS Modifier master. Pass
+    "modifier" to link an existing one, or just "label" — the
+    business's modifier of that name is reused, or created on first
+    use. Either way the same modifier can sit in any number of groups.
 
     Payload:
         {
@@ -816,7 +1257,7 @@ def save_modifier_group(group_json):
           "max_select": 0,
           "options": [
             {"label": "Small", "price": 0, "is_default": 1},
-            {"label": "Large", "price": 50}
+            {"modifier": "MOD-00007", "price": 50}
           ]
         }
     """
@@ -845,11 +1286,30 @@ def save_modifier_group(group_json):
     for opt in options:
         if not isinstance(opt, dict):
             continue
+        modifier_id = (opt.get("modifier") or "").strip()
         label = (opt.get("label") or "").strip()
-        if not label:
+        if modifier_id:
+            modifier = frappe.db.get_value(
+                "FlexiPOS Modifier",
+                modifier_id,
+                ["flexipos_company", "modifier_name"],
+                as_dict=True,
+            )
+            if not modifier:
+                frappe.throw(_("Modifier {0} does not exist").format(modifier_id))
+            if modifier.flexipos_company != company:
+                frappe.throw(
+                    _("Modifier {0} belongs to another business").format(modifier_id),
+                    frappe.PermissionError,
+                )
+            label = modifier.modifier_name
+        elif label:
+            modifier_id = _get_or_create_modifier(company, label, flt(opt.get("price")))
+        else:
             continue
         option_rows.append(
             {
+                "modifier": modifier_id,
                 "label": label,
                 "price": flt(opt.get("price")),
                 "is_default": cint(opt.get("is_default")),
@@ -891,7 +1351,12 @@ def save_modifier_group(group_json):
         "min_select": group.min_select,
         "max_select": group.max_select,
         "options": [
-            {"label": o.label, "price": flt(o.price), "is_default": o.is_default}
+            {
+                "modifier": o.modifier,
+                "label": o.label,
+                "price": flt(o.price),
+                "is_default": o.is_default,
+            }
             for o in group.options
         ],
     }

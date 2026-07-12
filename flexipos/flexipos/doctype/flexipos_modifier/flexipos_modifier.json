@@ -1,0 +1,67 @@
+{
+ "actions": [],
+ "autoname": "format:MOD-{#####}",
+ "creation": "2026-07-12 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "modifier_name",
+  "flexipos_company",
+  "column_break_1",
+  "price"
+ ],
+ "fields": [
+  {
+   "fieldname": "modifier_name",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "Modifier Name",
+   "reqd": 1
+  },
+  {
+   "description": "Modifiers are namespaced per business so two tenants can both have an \"Extra Cheese\" — hence the generated MOD-##### name instead of naming by modifier_name.",
+   "fieldname": "flexipos_company",
+   "fieldtype": "Link",
+   "in_standard_filter": 1,
+   "label": "Business",
+   "options": "Company",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "description": "Default price when this modifier is added to a group; each group option can override it.",
+   "fieldname": "price",
+   "fieldtype": "Currency",
+   "in_list_view": 1,
+   "label": "Price"
+  }
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-12 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Modifier",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 0,
+   "print": 0,
+   "read": 1,
+   "role": "System Manager",
+   "write": 1
+  }
+ ],
+ "search_fields": "modifier_name",
+ "show_title_field_in_link": 1,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "modifier_name"
+}
