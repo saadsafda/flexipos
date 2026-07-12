@@ -2203,11 +2203,68 @@ def add_staff(full_name, role, pin, email=None):
         }
     ).insert(ignore_permissions=True)
 
-    return {"user": user.name, "full_name": user.full_name, "role": role}
+    pos_profile = _assign_staff_to_company_pos_profile(user.name, company)
+
+    return {
+        "user": user.name,
+        "full_name": user.full_name,
+        "role": role,
+        "pos_profile": pos_profile,
+    }
+
+
+def _assign_staff_to_company_pos_profile(user, company):
+    """Add ``user`` to the current company's POS Profile users table.
+
+    Prefer the profile used by the admin making this request, provided it
+    belongs to the same company. Fall back to the company's first enabled
+    profile. Never attach a user to a profile owned by another tenant and
+    never create duplicate child rows.
+    """
+    profile_name = frappe.db.get_value(
+        "POS Profile User",
+        {
+            "user": frappe.session.user,
+            "parenttype": "POS Profile",
+        },
+        "parent",
+    )
+    if profile_name:
+        owner = frappe.db.get_value("POS Profile", profile_name, "company")
+        if owner != company:
+            profile_name = None
+
+    if not profile_name:
+        profile_name = frappe.db.get_value(
+            "POS Profile",
+            {"company": company, "disabled": 0},
+            "name",
+            order_by="creation asc",
+        )
+    if not profile_name:
+        frappe.throw(_("No enabled POS Profile found for company {0}").format(company))
+
+    already_assigned = frappe.db.exists(
+        "POS Profile User",
+        {
+            "parent": profile_name,
+            "parenttype": "POS Profile",
+            "user": user,
+        },
+    )
+    if not already_assigned:
+        profile = frappe.get_doc("POS Profile", profile_name)
+        if profile.company != company or profile.disabled:
+            frappe.throw(_("Invalid POS Profile for company {0}").format(company))
+        profile.append("applicable_for_users", {"user": user, "default": 1})
+        profile.flags.ignore_permissions = True
+        profile.save()
+
+    return profile_name
 
 
 @frappe.whitelist()
-def update_staff(user, full_name=None, role=None, new_pin=None):
+def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enabled=None):
     """Admin edits an existing staff member: rename, change role, and/or
     reset their PIN (including the admin's own — device binding is left
     untouched so a PIN reset doesn't kick them off their current device
@@ -2216,6 +2273,14 @@ def update_staff(user, full_name=None, role=None, new_pin=None):
     company = _get_user_company()
     _require_admin(company)
     _require_staff_of_company(user, company)
+
+    email = (email or "").strip().lower()
+    if email and email != user:
+        if user == frappe.session.user:
+            frappe.throw(_("You cannot change your own login email here"))
+        if frappe.db.exists("User", email):
+            frappe.throw(_("An account with {0} already exists").format(email))
+        user = frappe.rename_doc("User", user, email, force=True)
 
     updates = {}
     if full_name and full_name.strip():
@@ -2228,6 +2293,11 @@ def update_staff(user, full_name=None, role=None, new_pin=None):
             frappe.throw(_("PIN must be 4-6 digits"))
         salt = secrets.token_hex(16)
         updates[PIN_HASH_FIELD] = f"{salt}${_hash_pin(pin, salt)}"
+    if enabled is not None:
+        enabled = cint(enabled)
+        if not enabled and user == frappe.session.user:
+            frappe.throw(_("You cannot disable your own account"))
+        updates["enabled"] = enabled
 
     if updates:
         frappe.db.set_value("User", user, updates, update_modified=False)
