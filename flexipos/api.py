@@ -79,6 +79,11 @@ DEVICE_ID_FIELD = "flexipos_device_id"
 # type (Chef/Waiter for a restaurant, Pharmacist/Cashier for a pharmacy,
 # etc.) — see the Team & Roles screen's per-niche default suggestions.
 ROLE_FIELD = "flexipos_role"
+SCREEN_PERMISSIONS_FIELD = "flexipos_screen_permissions"
+ALL_SCREEN_PERMISSIONS = {
+    "quick_sale", "dashboard", "held_orders", "order_history", "inventory",
+    "tables", "kitchen", "shift", "reports", "staff", "settings",
+}
 ADMIN_ROLE = "Admin"
 # Item is a GLOBAL master in ERPNext (no company column), so FlexiPOS
 # stamps every item with its owning company and filters all reads on it.
@@ -363,6 +368,14 @@ def setup_custom_fields():
                     "no_copy": 1,
                     "insert_after": DEVICE_ID_FIELD,
                 },
+                {
+                    "fieldname": SCREEN_PERMISSIONS_FIELD,
+                    "label": "FlexiPOS Screen Permissions",
+                    "fieldtype": "Long Text",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": ROLE_FIELD,
+                },
             ],
         },
         ignore_validate=True,
@@ -387,6 +400,8 @@ def _ensure_custom_fields():
     # all the older ones do too (they are created together).
     if frappe.db.exists(
         "Custom Field", {"dt": "Item", "fieldname": MADE_TO_ORDER_FIELD}
+    ) and frappe.db.exists(
+        "Custom Field", {"dt": "User", "fieldname": SCREEN_PERMISSIONS_FIELD}
     ):
         return
     original_user = frappe.session.user
@@ -517,10 +532,12 @@ def get_my_business():
         "Company", profile.company, "flexipos_business_type"
     )
     role = frappe.db.get_value("User", user, ROLE_FIELD)
+    screen_permissions = _screen_permissions_for_user(user, role or ADMIN_ROLE)
     return {
         "company": profile.company,
         "business_type": business_type,
         "role": role or ADMIN_ROLE,
+        "screen_permissions": screen_permissions,
         "pos_profile": profile.name,
         "customer": profile.customer,
         "currency": profile.currency,
@@ -2082,6 +2099,7 @@ def verify_pin_login(pin, device_id):
         "user": user.name,
         "full_name": frappe.db.get_value("User", user.name, "full_name"),
         "role": role or ADMIN_ROLE,
+        "screen_permissions": _screen_permissions_for_user(user.name, role or ADMIN_ROLE),
         "sid": frappe.session.sid,
         **_get_api_credentials(user.name),
     }
@@ -2101,12 +2119,47 @@ def _hash_pin(pin, salt):
 # today (e.g. "Chef", "Waiter") and not yet wired to real permission
 # scoping — see the memory note on this being a UI-first pass.
 
+def _default_screen_permissions(role):
+    if role == ADMIN_ROLE:
+        return sorted(ALL_SCREEN_PERMISSIONS)
+    if role in ("Chef", "Baker"):
+        return ["quick_sale", "kitchen"]
+    if role == "Waiter":
+        return ["quick_sale", "held_orders", "tables", "kitchen"]
+    if role in ("Cashier", "Sales associate", "Receptionist"):
+        return ["quick_sale", "held_orders", "order_history", "shift"]
+    if role == "Stock keeper":
+        return ["inventory", "reports"]
+    if role in ("Pharmacist", "Technician"):
+        return ["quick_sale", "held_orders", "order_history"]
+    return ["quick_sale"]
+
+
+def _screen_permissions_for_user(user, role=None):
+    role = role or frappe.db.get_value("User", user, ROLE_FIELD) or ADMIN_ROLE
+    if role == ADMIN_ROLE:
+        return sorted(ALL_SCREEN_PERMISSIONS)
+    raw = frappe.db.get_value("User", user, SCREEN_PERMISSIONS_FIELD)
+    if raw:
+        try:
+            values = json.loads(raw)
+            if isinstance(values, list):
+                return [value for value in values if value in ALL_SCREEN_PERMISSIONS]
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return _default_screen_permissions(role)
+
+
+def _require_screen_access(permission):
+    if permission not in _screen_permissions_for_user(frappe.session.user):
+        frappe.throw(_("You do not have access to this screen"), frappe.PermissionError)
+
 @frappe.whitelist()
 def list_staff():
     """Every staff member linked to the caller's business, admin-only."""
     _ensure_custom_fields()
     company = _get_user_company()
-    _require_admin(company)
+    _require_screen_access("staff")
 
     user_names = frappe.get_all(
         "User Permission",
@@ -2119,7 +2172,7 @@ def list_staff():
     rows = frappe.get_all(
         "User",
         filters={"name": ("in", user_names)},
-        fields=["name", "full_name", "email", ROLE_FIELD, DEVICE_ID_FIELD, "enabled", "last_active"],
+        fields=["name", "full_name", "email", ROLE_FIELD, DEVICE_ID_FIELD, SCREEN_PERMISSIONS_FIELD, "enabled", "last_active"],
         order_by="full_name",
     )
     return {
@@ -2133,6 +2186,9 @@ def list_staff():
                 "enabled": r.enabled,
                 "last_active": str(r.last_active) if r.last_active else None,
                 "is_you": r.name == frappe.session.user,
+                "screen_permissions": _screen_permissions_for_user(
+                    r.name, r.get(ROLE_FIELD) or ADMIN_ROLE
+                ),
             }
             for r in rows
         ]
@@ -2140,13 +2196,13 @@ def list_staff():
 
 
 @frappe.whitelist()
-def add_staff(full_name, role, pin, email=None):
+def add_staff(full_name, role, pin, email=None, screen_permissions=None):
     """Create a new staff account under the caller's business and bind
     a PIN for it immediately (the admin sets it on the staff member's
     behalf, e.g. handing them a freshly configured device)."""
     _ensure_custom_fields()
     company = _get_user_company()
-    _require_admin(company)
+    _require_screen_access("staff")
 
     full_name = (full_name or "").strip()
     role = (role or "").strip()
@@ -2173,6 +2229,17 @@ def add_staff(full_name, role, pin, email=None):
     elif frappe.db.exists("User", email):
         frappe.throw(_("An account with {0} already exists").format(email))
 
+    if screen_permissions is not None:
+        try:
+            requested_permissions = json.loads(screen_permissions) if isinstance(screen_permissions, str) else screen_permissions
+        except json.JSONDecodeError:
+            frappe.throw(_("screen_permissions must be a valid list"))
+        if not isinstance(requested_permissions, list):
+            frappe.throw(_("screen_permissions must be a list"))
+        initial_permissions = [value for value in requested_permissions if value in ALL_SCREEN_PERMISSIONS]
+    else:
+        initial_permissions = _default_screen_permissions(role)
+
     salt = secrets.token_hex(16)
     user = frappe.get_doc(
         {
@@ -2183,6 +2250,7 @@ def add_staff(full_name, role, pin, email=None):
             "send_welcome_email": 0,
             ROLE_FIELD: role,
             PIN_HASH_FIELD: f"{salt}${_hash_pin(pin, salt)}",
+            SCREEN_PERMISSIONS_FIELD: json.dumps(initial_permissions),
         }
     )
     user.flags.no_welcome_mail = True
@@ -2264,14 +2332,14 @@ def _assign_staff_to_company_pos_profile(user, company):
 
 
 @frappe.whitelist()
-def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enabled=None):
+def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enabled=None, screen_permissions=None):
     """Admin edits an existing staff member: rename, change role, and/or
     reset their PIN (including the admin's own — device binding is left
     untouched so a PIN reset doesn't kick them off their current device
     unless they also re-register it)."""
     _ensure_custom_fields()
     company = _get_user_company()
-    _require_admin(company)
+    _require_screen_access("staff")
     _require_staff_of_company(user, company)
 
     email = (email or "").strip().lower()
@@ -2298,6 +2366,17 @@ def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enab
         if not enabled and user == frappe.session.user:
             frappe.throw(_("You cannot disable your own account"))
         updates["enabled"] = enabled
+    if screen_permissions is not None:
+        if user == frappe.session.user:
+            frappe.throw(_("You cannot change your own screen permissions"))
+        try:
+            requested = json.loads(screen_permissions) if isinstance(screen_permissions, str) else screen_permissions
+        except json.JSONDecodeError:
+            frappe.throw(_("screen_permissions must be a valid list"))
+        if not isinstance(requested, list):
+            frappe.throw(_("screen_permissions must be a list"))
+        cleaned = [value for value in requested if value in ALL_SCREEN_PERMISSIONS]
+        updates[SCREEN_PERMISSIONS_FIELD] = json.dumps(cleaned)
 
     if updates:
         frappe.db.set_value("User", user, updates, update_modified=False)
@@ -2309,8 +2388,9 @@ def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enab
 def remove_staff(user):
     """Disable a staff member (never delete — past sales/audit trail
     reference them). Cannot disable yourself."""
+    _ensure_custom_fields()
     company = _get_user_company()
-    _require_admin(company)
+    _require_screen_access("staff")
     _require_staff_of_company(user, company)
     if user == frappe.session.user:
         frappe.throw(_("You cannot remove your own account"))
