@@ -1,0 +1,71 @@
+name: Deploy backend staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git branch, tag, or commit to deploy
+        required: true
+        default: version-16
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Backup, migrate and deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_BACKEND_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.STAGING_SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+      - name: Upload deployment tools
+        env:
+          SSH_HOST: ${{ vars.STAGING_SSH_HOST }}
+          SSH_PORT: ${{ vars.STAGING_SSH_PORT }}
+          SSH_USER: ${{ vars.STAGING_SSH_USER }}
+        run: |
+          test -n "$SSH_HOST" && test -n "$SSH_USER"
+          SSH_PORT="${SSH_PORT:-22}"
+          REMOTE_DIR="/tmp/flexipos-backend-${GITHUB_RUN_ID}"
+          echo "REMOTE_DIR=$REMOTE_DIR" >> "$GITHUB_ENV"
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_DIR'"
+          scp -P "$SSH_PORT" scripts/backup_site.sh scripts/deploy_staging.sh \
+            "$SSH_USER@$SSH_HOST:$REMOTE_DIR/"
+      - name: Deploy with pre-migration backup
+        env:
+          SSH_HOST: ${{ vars.STAGING_SSH_HOST }}
+          SSH_PORT: ${{ vars.STAGING_SSH_PORT }}
+          SSH_USER: ${{ vars.STAGING_SSH_USER }}
+          BENCH_PATH: ${{ vars.STAGING_BENCH_PATH }}
+          SITE: ${{ vars.STAGING_SITE }}
+          HEALTH_URL: ${{ vars.STAGING_BACKEND_URL }}
+          DEPLOY_REF: ${{ inputs.ref }}
+        run: |
+          test -n "$BENCH_PATH" && test -n "$SITE" && test -n "$HEALTH_URL"
+          SSH_PORT="${SSH_PORT:-22}"
+          printf -v REMOTE_COMMAND '%q ' env \
+            "BENCH_PATH=$BENCH_PATH" "SITE=$SITE" "DEPLOY_REF=$DEPLOY_REF" \
+            "HEALTHCHECK_URL=${HEALTH_URL%/}/api/method/ping" \
+            "BACKUP_SCRIPT=$REMOTE_DIR/backup_site.sh" \
+            bash "$REMOTE_DIR/deploy_staging.sh"
+          ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "$REMOTE_COMMAND"
+      - name: Remove SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

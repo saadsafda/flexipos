@@ -1,6 +1,9 @@
-### Flexipos
+### FlexiPOS backend
 
-Flexi POS
+Frappe/ERPNext API and tenant-isolation layer for the FlexiPOS clients.
+
+Operational setup for CI, Sentry, encrypted backups, restore drills, and the
+protected staging deployment is in [`docs/operations.md`](docs/operations.md).
 
 ### Installation
 
@@ -30,4 +33,4 @@ Pre-commit is configured to use the following tools for checking and formatting 
 
 ### License
 
-mit
+MIT

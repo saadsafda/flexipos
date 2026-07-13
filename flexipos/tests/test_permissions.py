@@ -1,6 +1,9 @@
 import ast
+import json
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import MagicMock, patch
+from uuid import uuid4
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -194,6 +197,228 @@ class TestTenantOwnership(FrappeTestCase):
         self.assertEqual(config["service_styles"], ["Dine-in", "Takeaway"])
 
 
+class TestTenantIsolationIntegration(FrappeTestCase):
+    """Exercise tenant boundaries against real records, not mocked guards."""
+
+    def setUp(self):
+        self.previous_user = frappe.session.user
+        frappe.set_user("Administrator")
+        companies = frappe.get_all("Company", pluck="name", limit=2)
+        if len(companies) < 2:
+            self.skipTest("Tenant-isolation tests require two companies")
+        self.company_a, self.company_b = companies
+        self.suffix = uuid4().hex[:12]
+        self.created = []
+
+    def tearDown(self):
+        frappe.set_user("Administrator")
+        for doctype, name in reversed(getattr(self, "created", [])):
+            if frappe.db.exists(doctype, name):
+                frappe.delete_doc(doctype, name, ignore_permissions=True)
+        frappe.set_user(self.previous_user)
+
+    def _insert(self, doctype, **values):
+        doc = frappe.get_doc({"doctype": doctype, **values})
+        doc.insert(ignore_permissions=True)
+        self.created.append((doctype, doc.name))
+        return doc
+
+    def _held_order(self, company, offline_id, register_id):
+        return self._insert(
+            "FlexiPOS Held Order",
+            offline_id=offline_id,
+            company=company,
+            register_id=register_id,
+            order_type="Dine-in",
+            grand_total=10,
+            item_count=1,
+            lines_json='[{"item_code":"TEST","qty":1}]',
+            held_at=frappe.utils.now_datetime(),
+        )
+
+    def _shift(self, company, shift_id, register_id):
+        return self._insert(
+            "FlexiPOS Shift",
+            shift_id=shift_id,
+            company=company,
+            register_id=register_id,
+            staff_user="Administrator",
+            opening_float=100,
+            opened_at=frappe.utils.now_datetime(),
+            status="Open",
+        )
+
+    def _movement(self, company, movement_id, register_id, shift):
+        return self._insert(
+            "FlexiPOS Cash Movement",
+            movement_id=movement_id,
+            company=company,
+            register_id=register_id,
+            shift=shift,
+            movement_type="Pay In",
+            amount=10,
+            created_at=frappe.utils.now_datetime(),
+        )
+
+    def test_shared_state_returns_only_the_requested_company(self):
+        table_no = f"tenant-table-{self.suffix}"
+        table_a = api._table_state_key(self.company_a, table_no)
+        table_b = api._table_state_key(self.company_b, table_no)
+        api._upsert_shared_table(
+            self.company_a, table_no, "Free", None, "register-a"
+        )
+        self.created.append(("FlexiPOS Table", table_a))
+        api._upsert_shared_table(
+            self.company_b, table_no, "Occupied", "sale-b", "register-b"
+        )
+        self.created.append(("FlexiPOS Table", table_b))
+        held_a = f"held-a-{self.suffix}"
+        held_b = f"held-b-{self.suffix}"
+        self._held_order(self.company_a, held_a, "register-a")
+        self._held_order(self.company_b, held_b, "register-b")
+
+        state = api._shared_register_state(
+            self.company_a, "register-a", include_shift=False
+        )
+        matching_tables = [
+            row for row in state["tables"] if row["table_no"] == table_no
+        ]
+        held_ids = {row["id"] for row in state["held_orders"]}
+
+        self.assertEqual(len(matching_tables), 1)
+        self.assertEqual(matching_tables[0]["register_id"], "register-a")
+        self.assertIn(held_a, held_ids)
+        self.assertNotIn(held_b, held_ids)
+
+    def test_same_table_number_cannot_overwrite_another_tenant(self):
+        table_no = f"collision-{self.suffix}"
+        table_a = api._table_state_key(self.company_a, table_no)
+        table_b = api._table_state_key(self.company_b, table_no)
+        api._upsert_shared_table(
+            self.company_a, table_no, "Free", None, "register-a"
+        )
+        self.created.append(("FlexiPOS Table", table_a))
+        api._upsert_shared_table(
+            self.company_b, table_no, "Occupied", "sale-b", "register-b"
+        )
+        self.created.append(("FlexiPOS Table", table_b))
+
+        api._apply_table_operation(
+            self.company_a,
+            "register-a",
+            "table_upsert",
+            {
+                "table_no": table_no,
+                "status": "occupied",
+                "current_offline_invoice_id": "sale-a",
+            },
+        )
+
+        row_a = frappe.db.get_value(
+            "FlexiPOS Table",
+            table_a,
+            ["company", "current_offline_invoice_id", "register_id"],
+            as_dict=True,
+        )
+        row_b = frappe.db.get_value(
+            "FlexiPOS Table",
+            table_b,
+            ["company", "current_offline_invoice_id", "register_id"],
+            as_dict=True,
+        )
+        self.assertEqual(row_a.company, self.company_a)
+        self.assertEqual(row_a.current_offline_invoice_id, "sale-a")
+        self.assertEqual(row_b.company, self.company_b)
+        self.assertEqual(row_b.current_offline_invoice_id, "sale-b")
+        self.assertEqual(row_b.register_id, "register-b")
+
+    def test_cross_tenant_held_order_delete_is_rejected(self):
+        held_b = f"held-b-{self.suffix}"
+        self._held_order(self.company_b, held_b, "register-b")
+
+        operations = json.dumps(
+            [{"action": "held_delete", "payload": {"id": held_b}}]
+        )
+        with (
+            patch.object(api, "_require_any_screen_access"),
+            patch.object(api, "_get_user_company", return_value=self.company_a),
+            patch.object(api, "_validate_register_id", return_value="register-a"),
+            patch.object(
+                api, "_screen_permissions_for_user", return_value=["held_orders"]
+            ),
+            self.assertRaises(frappe.PermissionError),
+        ):
+            api.sync_register_state("register-a", operations)
+
+        self.assertTrue(frappe.db.exists("FlexiPOS Held Order", held_b))
+
+    def test_cross_tenant_cash_movement_is_rejected(self):
+        shift_b = f"shift-b-{self.suffix}"
+        self._shift(self.company_b, shift_b, "register-b")
+
+        with self.assertRaises(frappe.PermissionError):
+            api._apply_shift_operation(
+                self.company_a,
+                "register-a",
+                "movement_upsert",
+                {
+                    "movement_id": f"movement-a-{self.suffix}",
+                    "shift_id": shift_b,
+                    "type": "pay_in",
+                    "amount": 10,
+                },
+            )
+
+        self.assertFalse(
+            frappe.db.exists(
+                "FlexiPOS Cash Movement", f"movement-a-{self.suffix}"
+            )
+        )
+
+    def test_shift_snapshot_is_scoped_to_company_and_register(self):
+        shift_a1 = f"shift-a1-{self.suffix}"
+        shift_a2 = f"shift-a2-{self.suffix}"
+        shift_b1 = f"shift-b1-{self.suffix}"
+        self._shift(self.company_a, shift_a1, "register-a")
+        self._shift(self.company_a, shift_a2, "register-a-other")
+        self._shift(self.company_b, shift_b1, "register-a")
+        movement_a1 = f"movement-a1-{self.suffix}"
+        movement_a2 = f"movement-a2-{self.suffix}"
+        self._movement(
+            self.company_a, movement_a1, "register-a", shift_a1
+        )
+        self._movement(
+            self.company_a, movement_a2, "register-a-other", shift_a2
+        )
+
+        state = api._shared_register_state(
+            self.company_a, "register-a", include_shift=True
+        )
+
+        self.assertEqual({row["id"] for row in state["shifts"]}, {shift_a1})
+        self.assertEqual(
+            {row["movement_id"] for row in state["cash_movements"]},
+            {movement_a1},
+        )
+
+    def test_invoice_batch_rejects_payload_for_another_company(self):
+        payload = {
+            "offline_invoice_id": f"cross-tenant-sale-{self.suffix}",
+            "company": self.company_b,
+            "items": [{"item_code": "ANY", "qty": 1}],
+        }
+        with (
+            patch.object(api, "_require_screen_access"),
+            patch.object(api, "_get_user_company", return_value=self.company_a),
+            patch.object(api, "_create_pos_invoice") as create_invoice,
+        ):
+            response = api.push_offline_invoices(json.dumps([payload]))
+
+        self.assertEqual(response["results"][0]["status"], "failed")
+        self.assertIn("Not permitted", response["results"][0]["error"])
+        create_invoice.assert_not_called()
+
+
 class TestAuthoritativePricing(FrappeTestCase):
     def test_price_estimate_tolerance_is_small_and_finite(self):
         self.assertTrue(api._estimate_matches(100, 100.009))
@@ -264,7 +489,7 @@ class TestAuthoritativePricing(FrappeTestCase):
 class TestEndpointPermissionContract(FrappeTestCase):
     """Prevent future endpoints from accidentally losing their API guard."""
 
-    account_lifecycle_endpoints = {
+    account_lifecycle_endpoints: ClassVar[set[str]] = {
         "register_business",
         "get_my_business",
         "get_device_token",
@@ -274,7 +499,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "verify_login_otp",
     }
 
-    required_guards = {
+    required_guards: ClassVar[dict[str, set[str]]] = {
         "setup_new_business": {"_require_business_setup_access"},
         "sync_inventory": {"_require_any_screen_access"},
         "save_business_setup": {"_require_screen_access", "_require_admin"},
@@ -294,7 +519,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "remove_staff": {"_require_screen_access", "_require_admin"},
     }
 
-    ownership_guards = {
+    ownership_guards: ClassVar[dict[str, set[str]]] = {
         "get_my_business": {"_get_user_company", "_get_pos_profile_for_company"},
         "save_item": {"_require_document_company"},
         "sync_register_state": {"_get_user_company"},

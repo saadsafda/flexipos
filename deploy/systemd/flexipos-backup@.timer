@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted FlexiPOS backup for Frappe site %i
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=flexipos-backup@%i.service
+
+[Install]
+WantedBy=timers.target

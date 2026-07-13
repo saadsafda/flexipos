@@ -1,0 +1,86 @@
+name: Frappe backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [version-16]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and tenant-isolation tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s --health-timeout=2s --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: flexipos-src
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@v6
+      - name: Static checks
+        working-directory: flexipos-src
+        run: |
+          uvx ruff check flexipos
+          python -m compileall -q -f flexipos
+          if grep -R --exclude-dir=.git '^<<<<<<< ' .; then
+            echo 'Unresolved merge conflict found' >&2
+            exit 1
+          fi
+      - name: Install bench dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq redis-server mariadb-client libmariadb-dev libcups2-dev
+          sudo systemctl start redis-server
+          uv tool install frappe-bench
+      - name: Create Frappe test bench
+        env:
+          BENCH: ${{ runner.temp }}/frappe-bench
+        run: |
+          git clone --depth 1 --branch version-16 https://github.com/frappe/frappe.git "${RUNNER_TEMP}/frappe-src"
+          git clone --depth 1 --branch version-16 https://github.com/frappe/erpnext.git "${RUNNER_TEMP}/erpnext-src"
+          bench init "$BENCH" --frappe-path "${RUNNER_TEMP}/frappe-src" \
+            --python "$(command -v python)" --skip-assets --no-backups
+          cd "$BENCH"
+          bench get-app "${RUNNER_TEMP}/erpnext-src"
+          bench get-app "${GITHUB_WORKSPACE}/flexipos-src"
+          bench setup requirements --dev
+          bench set-config -g root_login root
+          bench set-config -g root_password root
+          bench set-config -g redis_cache redis://127.0.0.1:6379
+          bench set-config -g redis_queue redis://127.0.0.1:6379
+          bench new-site test_site --db-host 127.0.0.1 \
+            --db-root-password root --admin-password admin --no-mariadb-socket
+          bench --site test_site set-config allow_tests 1 --parse
+          bench --site test_site install-app erpnext
+          bench --site test_site install-app flexipos
+      - name: Run backend test suite
+        working-directory: ${{ runner.temp }}/frappe-bench
+        run: bench --site test_site run-tests --app flexipos
+      - name: Show bench logs after a failure
+        if: failure()
+        run: |
+          find "${RUNNER_TEMP}/frappe-bench/logs" -maxdepth 1 -type f -print \
+            -exec tail -n 200 {} \; || true

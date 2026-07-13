@@ -1,0 +1,18 @@
+[Unit]
+Description=Encrypted FlexiPOS backup for Frappe site %i
+After=network-online.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=frappe
+Group=frappe
+Environment=SITE=%i
+EnvironmentFile=/etc/flexipos/backup.env
+WorkingDirectory=/home/frappe/frappe-bench
+ExecStart=/usr/bin/env bash /home/frappe/frappe-bench/apps/flexipos/scripts/backup_site.sh
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

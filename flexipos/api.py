@@ -37,7 +37,7 @@ hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
     Item.flexipos_material (Clothing: fabric label)
     Item.flexipos_season (Clothing: season/collection label)
     Item.flexipos_gender (Clothing: Men/Women/Unisex/Kids)
-    Item.flexipos_variant_matrix (Clothing: size×colour stock matrix, JSON)
+    Item.flexipos_variant_matrix (Clothing: size x colour stock matrix, JSON)
     Item.flexipos_tax_rate (item tax %, stored per item)
     Item.flexipos_stock_qty (simple on-hand count, not ledger stock)
     Item.flexipos_dietary_flags (Restaurant: CSV, e.g. "Halal,Gluten-free")
@@ -1120,7 +1120,7 @@ def save_item(item_json):
           "material": "100% Linen",    # Clothing
           "season": "SS26",            # Clothing
           "gender": "Unisex",          # Clothing: Men/Women/Unisex/Kids
-          "variant_matrix": {...},     # Clothing size×colour stock matrix
+          "variant_matrix": {...},     # Clothing size x colour stock matrix
                                        # (see VARIANT_MATRIX_FIELD comment);
                                        # omit to leave unchanged, null/{} to
                                        # clear
@@ -1346,7 +1346,7 @@ def _clean_dietary_flags(raw):
 
 
 def _clean_variant_matrix(raw):
-    """Validate and normalise the clothing size×colour matrix into the
+    """Validate and normalise the clothing size x colour matrix into the
     canonical JSON shape (see VARIANT_MATRIX_FIELD) so the client can
     trust whatever it syncs back. Returns None to clear the field."""
     if not raw:
@@ -2761,7 +2761,7 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     # both with the already resolved company-owned price/tax records.
     has_tax = any(line["tax_rate"] > 0 for line in authoritative_lines)
     tax_account = _get_output_tax_account(company) if has_tax else None
-    for invoice_item, line in zip(doc.items, authoritative_lines):
+    for invoice_item, line in zip(doc.items, authoritative_lines, strict=True):
         invoice_item.price_list_rate = line["rate"]
         invoice_item.rate = line["rate"]
         invoice_item.discount_percentage = 0
