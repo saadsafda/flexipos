@@ -153,6 +153,73 @@ class TestTenantOwnership(FrappeTestCase):
             )
 
 
+class TestAuthoritativePricing(FrappeTestCase):
+    def test_price_estimate_tolerance_is_small_and_finite(self):
+        self.assertTrue(api._estimate_matches(100, 100.009))
+        self.assertFalse(api._estimate_matches(100, 100.02))
+        self.assertFalse(api._estimate_matches(100, float("nan")))
+
+    def test_customer_price_wins_and_expired_prices_are_ignored(self):
+        rows = [
+            frappe._dict(
+                price_list_rate=90,
+                uom="Nos",
+                customer=None,
+                batch_no=None,
+                valid_from="2026-01-01",
+                valid_upto=None,
+            ),
+            frappe._dict(
+                price_list_rate=80,
+                uom="Nos",
+                customer="CUSTOMER-1",
+                batch_no=None,
+                valid_from="2026-01-01",
+                valid_upto="2026-06-30",
+            ),
+            frappe._dict(
+                price_list_rate=85,
+                uom="Nos",
+                customer="CUSTOMER-1",
+                batch_no=None,
+                valid_from="2026-07-01",
+                valid_upto=None,
+            ),
+        ]
+        with patch.object(frappe, "get_all", return_value=rows):
+            rate = api._get_authoritative_item_price(
+                "ITEM-1",
+                "Standard Selling",
+                "Nos",
+                "CUSTOMER-1",
+                "2026-07-13",
+            )
+        self.assertEqual(rate, 85)
+
+    def test_modifier_price_is_resolved_from_server_option(self):
+        group = frappe._dict(
+            name="GROUP-1",
+            group_name="Add-ons",
+            flexipos_company="Company A",
+            selection_type="Multiple",
+            required=0,
+            min_select=0,
+            max_select=3,
+            options=[frappe._dict(label="Cheese", price=25)],
+        )
+        links = [frappe._dict(modifier_group="GROUP-1", idx=1)]
+        with (
+            patch.object(frappe, "get_all", return_value=links),
+            patch.object(frappe, "get_cached_doc", return_value=group),
+        ):
+            resolved = api._resolve_authoritative_modifiers(
+                "ITEM-1",
+                "Company A",
+                [{"group": "Add-ons", "label": "Cheese", "price": 999}],
+            )
+        self.assertEqual(resolved[0]["price"], 25)
+
+
 class TestEndpointPermissionContract(FrappeTestCase):
     """Prevent future endpoints from accidentally losing their API guard."""
 
@@ -194,6 +261,9 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "_create_pos_invoice": {
             "_get_pos_profile_for_company",
             "_require_document_company",
+            "_get_authoritative_item_price",
+            "_resolve_authoritative_modifiers",
+            "_get_output_tax_account",
         },
         "update_kitchen_status": {"_require_document_company"},
         "process_refund": {"_require_document_company"},

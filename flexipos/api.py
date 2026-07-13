@@ -51,6 +51,7 @@ lookup_item_by_barcode.
 import base64
 import hashlib
 import json
+import math
 import secrets
 
 import frappe
@@ -125,9 +126,9 @@ SEASON_FIELD = "flexipos_season"
 GENDER_FIELD = "flexipos_gender"
 VARIANT_MATRIX_FIELD = "flexipos_variant_matrix"
 GENDER_OPTIONS = ["Men", "Women", "Unisex", "Kids"]
-# Item tax % shown on receipts-to-be: stored per item and synced, but not
-# yet folded into Sales Invoice taxes (needs a Sales Taxes and Charges
-# row + client-side receipt math — its own project).
+# Item tax percentage. FlexiPOS selling prices are tax-inclusive; invoice
+# creation resolves this value from the server and creates the matching
+# inclusive Sales Taxes and Charges row.
 TAX_RATE_FIELD = "flexipos_tax_rate"
 # Simple on-hand count typed by the merchant. NOT ledger stock — items
 # stay is_stock_item=0, same reasoning as the clothing variant matrix.
@@ -164,6 +165,8 @@ MAX_IMAGE_BYTES = 3 * 1024 * 1024
 # Batches larger than this are pushed to a background worker; the client
 # re-syncs later and the duplicate check below makes retries safe.
 INLINE_BATCH_LIMIT = 25
+PRICE_TOLERANCE = 0.01
+TAX_RATE_TOLERANCE = 0.0001
 
 MAX_PIN_ATTEMPTS = 5
 PIN_LOCKOUT_SECONDS = 300
@@ -810,6 +813,8 @@ def sync_inventory(last_sync_datetime=None):
     _require_any_screen_access("quick_sale", "inventory")
     _ensure_custom_fields()
     company = _get_user_company()
+    profile = _get_pos_profile_for_company(None, company, frappe.session.user)
+    selling_price_list = profile.selling_price_list
     server_time = str(now_datetime())
 
     item_filters = {"is_sales_item": 1, COMPANY_FIELD: company}
@@ -917,7 +922,7 @@ def sync_inventory(last_sync_datetime=None):
     if company_item_codes:
         price_filters = {
             "selling": 1,
-            "price_list": DEFAULT_PRICE_LIST,
+            "price_list": selling_price_list,
             "item_code": ("in", company_item_codes),
         }
         if last_sync_datetime:
@@ -989,8 +994,7 @@ def save_item(item_json):
           "sku": "CL-2210",            # create only: item_code becomes
                                        # "<company abbr>-CL-2210"
           "cost_price": 60,            # Item.valuation_rate
-          "tax_rate": 5,               # item tax %, stored (not yet applied
-                                       # to invoice totals)
+          "tax_rate": 5,               # inclusive item tax percentage
           "stock_qty": 40,             # simple on-hand count, not ledger
           "dietary_flags": ["Halal"],  # Restaurant (list or CSV string)
           "recipe_depletion": 1,       # Restaurant: recipe/BOM flag
@@ -1029,6 +1033,9 @@ def save_item(item_json):
     price = flt(data.get("price"))
     if price < 0:
         frappe.throw(_("Price cannot be negative"))
+    tax_rate = flt(data.get("tax_rate"))
+    if tax_rate < 0 or tax_rate > 100:
+        frappe.throw(_("Tax rate must be between 0 and 100"))
     category = (data.get("category") or "").strip() or "Products"
     uom = (data.get("uom") or "Nos").strip()
     if not frappe.db.exists("UOM", uom):
@@ -1068,7 +1075,7 @@ def save_item(item_json):
         if "variant_matrix" in data:
             item.set(VARIANT_MATRIX_FIELD, _clean_variant_matrix(data.get("variant_matrix")))
         if "tax_rate" in data:
-            item.set(TAX_RATE_FIELD, flt(data.get("tax_rate")))
+            item.set(TAX_RATE_FIELD, tax_rate)
         if "stock_qty" in data:
             item.set(STOCK_QTY_FIELD, max(cint(data.get("stock_qty")), 0))
         if "dietary_flags" in data:
@@ -1117,7 +1124,7 @@ def save_item(item_json):
                 SEASON_FIELD: (data.get("season") or "").strip(),
                 GENDER_FIELD: _clean_gender(data.get("gender")),
                 VARIANT_MATRIX_FIELD: _clean_variant_matrix(data.get("variant_matrix")),
-                TAX_RATE_FIELD: flt(data.get("tax_rate")),
+                TAX_RATE_FIELD: tax_rate,
                 STOCK_QTY_FIELD: max(cint(data.get("stock_qty")), 0),
                 DIETARY_FIELD: _clean_dietary_flags(data.get("dietary_flags")),
                 RECIPE_DEPLETION_FIELD: cint(data.get("recipe_depletion")),
@@ -1144,7 +1151,8 @@ def save_item(item_json):
         )
         item.insert(ignore_permissions=True)
 
-    _set_selling_price(item.name, price)
+    profile = _get_pos_profile_for_company(None, company, frappe.session.user)
+    _set_selling_price(item.name, price, profile.selling_price_list)
 
     # "barcode" present (even blank) → replace the item's primary barcode;
     # absent (key missing) → leave whatever is already assigned alone.
@@ -1753,10 +1761,18 @@ def _make_item_code(company, item_name):
     return candidate
 
 
-def _set_selling_price(item_code, rate):
+def _set_selling_price(item_code, rate, price_list=DEFAULT_PRICE_LIST):
+    uom = frappe.db.get_value("Item", item_code, "stock_uom")
     existing = frappe.db.get_value(
         "Item Price",
-        {"item_code": item_code, "price_list": DEFAULT_PRICE_LIST, "selling": 1},
+        {
+            "item_code": item_code,
+            "price_list": price_list,
+            "selling": 1,
+            "uom": uom,
+            "customer": ("is", "not set"),
+            "batch_no": ("is", "not set"),
+        },
         "name",
     )
     if existing:
@@ -1767,7 +1783,8 @@ def _set_selling_price(item_code, rate):
             {
                 "doctype": "Item Price",
                 "item_code": item_code,
-                "price_list": DEFAULT_PRICE_LIST,
+                "price_list": price_list,
+                "uom": uom,
                 "selling": 1,
                 "price_list_rate": rate,
             }
@@ -1892,11 +1909,20 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
             "name",
         )
         if existing:
+            totals = frappe.db.get_value(
+                "Sales Invoice",
+                existing,
+                ["net_total", "total_taxes_and_charges", "grand_total"],
+                as_dict=True,
+            )
             results.append(
                 {
                     "offline_invoice_id": offline_id,
                     "status": "duplicate",
                     "invoice": existing,
+                    "net_total": flt(totals.net_total),
+                    "tax_total": flt(totals.total_taxes_and_charges),
+                    "grand_total": flt(totals.grand_total),
                 }
             )
             continue
@@ -1915,6 +1941,8 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                     "offline_invoice_id": offline_id,
                     "status": "success",
                     "invoice": doc.name,
+                    "net_total": flt(doc.net_total),
+                    "tax_total": flt(doc.total_taxes_and_charges),
                     "grand_total": flt(doc.grand_total),
                 }
             )
@@ -1933,6 +1961,164 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                 }
             )
     return results
+
+
+def _get_authoritative_item_price(
+    item_code,
+    price_list,
+    uom,
+    customer,
+    posting_date,
+):
+    """Return the applicable server Item Price, never a client-provided rate."""
+    rows = frappe.get_all(
+        "Item Price",
+        filters={
+            "item_code": item_code,
+            "price_list": price_list,
+            "selling": 1,
+        },
+        fields=[
+            "name",
+            "price_list_rate",
+            "uom",
+            "customer",
+            "batch_no",
+            "valid_from",
+            "valid_upto",
+            "modified",
+        ],
+        order_by="valid_from desc, modified desc",
+        limit_page_length=0,
+    )
+    posting_date = str(posting_date)
+    candidates = []
+    for row in rows:
+        if row.uom and row.uom != uom:
+            continue
+        if row.customer and row.customer != customer:
+            continue
+        if row.batch_no:
+            continue
+        if row.valid_from and str(row.valid_from) > posting_date:
+            continue
+        if row.valid_upto and str(row.valid_upto) < posting_date:
+            continue
+        candidates.append(row)
+
+    if not candidates:
+        frappe.throw(
+            _("No active selling price exists for item {0}").format(item_code)
+        )
+
+    # Customer-specific prices outrank generic rows; the query order then
+    # picks the newest effective price within that class.
+    candidates.sort(key=lambda row: 0 if row.customer == customer else 1)
+    rate = flt(candidates[0].price_list_rate)
+    if not math.isfinite(rate) or rate < 0:
+        frappe.throw(_("The selling price for item {0} is invalid").format(item_code))
+    return rate
+
+
+def _resolve_authoritative_modifiers(item_code, company, requested):
+    """Validate selections against groups assigned to the item and re-price them."""
+    if requested is None:
+        requested = []
+    if not isinstance(requested, list):
+        frappe.throw(_("Item modifiers must be a list"))
+
+    links = frappe.get_all(
+        "FlexiPOS Item Modifier Group",
+        filters={"parent": item_code, "parenttype": "Item"},
+        fields=["modifier_group", "idx"],
+        order_by="idx",
+        limit_page_length=0,
+    )
+    groups = []
+    by_key = {}
+    for link in links:
+        group = frappe.get_cached_doc("FlexiPOS Modifier Group", link.modifier_group)
+        if group.flexipos_company != company:
+            frappe.throw(
+                _("An assigned modifier group is not available for this business"),
+                frappe.PermissionError,
+            )
+        groups.append(group)
+        by_key[group.name] = group
+        by_key[group.group_name] = group
+
+    selected_by_group = {group.name: [] for group in groups}
+    seen = set()
+    resolved = []
+    for value in requested:
+        if not isinstance(value, dict):
+            frappe.throw(_("Each modifier must be an object"))
+        group_key = (value.get("group") or "").strip()
+        label = (value.get("label") or "").strip()
+        group = by_key.get(group_key)
+        if not group or not label:
+            frappe.throw(_("A selected modifier is not available for this item"))
+        key = (group.name, label)
+        if key in seen:
+            frappe.throw(_("The same modifier cannot be selected twice"))
+        matches = [option for option in group.options if option.label == label]
+        if len(matches) != 1:
+            frappe.throw(_("A selected modifier is not available for this item"))
+        seen.add(key)
+        option = matches[0]
+        selected_by_group[group.name].append(option)
+        resolved.append(
+            {
+                "group": group.group_name,
+                "label": option.label,
+                "price": flt(option.price),
+            }
+        )
+
+    for group in groups:
+        count = len(selected_by_group[group.name])
+        minimum = max(cint(group.min_select), 1 if group.required else 0)
+        maximum = cint(group.max_select)
+        if group.selection_type == "Single" and count > 1:
+            frappe.throw(_("Choose only one option from {0}").format(group.group_name))
+        if count < minimum:
+            frappe.throw(_("Choose at least {0} option(s) from {1}").format(minimum, group.group_name))
+        if maximum and count > maximum:
+            frappe.throw(_("Choose no more than {0} option(s) from {1}").format(maximum, group.group_name))
+
+    return resolved
+
+
+def _get_output_tax_account(company):
+    account = frappe.db.get_value(
+        "Account",
+        {
+            "company": company,
+            "account_name": "FlexiPOS Output Tax",
+            "account_type": "Tax",
+            "is_group": 0,
+            "disabled": 0,
+        },
+    )
+    if account:
+        return account
+
+    from erpnext.setup.setup_wizard.operations.taxes_setup import (
+        get_or_create_account,
+    )
+
+    return get_or_create_account(
+        company,
+        {
+            "account_name": "FlexiPOS Output Tax",
+            "root_type": "Liability",
+        },
+    ).name
+
+
+def _estimate_matches(server_value, client_value, tolerance=PRICE_TOLERANCE):
+    client_value = flt(client_value)
+    return math.isfinite(client_value) and abs(server_value - client_value) <= tolerance
 
 
 def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
@@ -1968,18 +2154,24 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     item_rows = frappe.get_all(
         "Item",
         filters={"name": ("in", list(item_codes))},
-        fields=["name", COMPANY_FIELD, "disabled", "stock_uom"],
+        fields=["name", COMPANY_FIELD, "disabled", "stock_uom", TAX_RATE_FIELD],
         limit_page_length=0,
     ) if item_codes else []
     owned_items = {row.name: row for row in item_rows}
 
-    posting = get_datetime(payload.get("posting_datetime") or now_datetime())
+    server_now = now_datetime()
+    posting = get_datetime(payload.get("posting_datetime") or server_now)
+    if posting > add_to_date(server_now, minutes=5) or posting < add_to_date(
+        server_now, days=-30
+    ):
+        frappe.throw(_("Sale time is outside the allowed offline window"))
     order_type = payload.get("order_type")
     # Only Dine-in/Takeaway orders go through the kitchen; Delivery
     # (or no order type at all, e.g. non-restaurant businesses) skip it.
     kitchen_status = "Placed" if order_type in ("Dine-in", "Takeaway") else None
 
     doc = frappe.new_doc("Sales Invoice")
+    doc.flags.ignore_pricing_rule = True
     doc.update(
         {
             "company": company,
@@ -2011,6 +2203,9 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         )
         doc.branch = branch
 
+    authoritative_lines = []
+    client_gross = 0
+    server_gross = 0
     for row in items:
         if not isinstance(row, dict):
             frappe.throw(_("Invoice item must be an object"))
@@ -2023,7 +2218,37 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             )
         if item.disabled:
             frappe.throw(_("Item {0} is disabled").format(item_code))
-        modifiers = row.get("modifiers") or []
+        qty = flt(row.get("qty"))
+        if not math.isfinite(qty) or qty <= 0:
+            frappe.throw(_("Quantity for item {0} must be greater than zero").format(item_code))
+        base_rate = _get_authoritative_item_price(
+            item_code,
+            profile.selling_price_list,
+            item.stock_uom,
+            profile.customer,
+            server_now.date(),
+        )
+        modifiers = _resolve_authoritative_modifiers(
+            item_code, company, row.get("modifiers")
+        )
+        server_rate = base_rate + sum(flt(m["price"]) for m in modifiers)
+        if not math.isfinite(server_rate) or server_rate < 0:
+            frappe.throw(_("The total price for item {0} is invalid").format(item_code))
+        if "rate" not in row or not _estimate_matches(server_rate, row.get("rate")):
+            frappe.throw(
+                _("Price changed for {0}. Refresh the catalog and retry the sale.").format(item_code)
+            )
+        tax_rate = flt(item.get(TAX_RATE_FIELD))
+        if not math.isfinite(tax_rate) or tax_rate < 0 or tax_rate > 100:
+            frappe.throw(_("The tax rate for item {0} is invalid").format(item_code))
+        if "tax_rate" in row and not _estimate_matches(
+            tax_rate, row.get("tax_rate"), TAX_RATE_TOLERANCE
+        ):
+            frappe.throw(
+                _("Tax changed for {0}. Refresh the catalog and retry the sale.").format(item_code)
+            )
+        client_gross += flt(row.get("rate")) * qty
+        server_gross += server_rate * qty
         description = (
             ", ".join(
                 f"{m.get('label')}"
@@ -2038,44 +2263,70 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             "items",
             {
                 "item_code": item_code,
-                "qty": flt(row.get("qty")) or 1,
-                "rate": flt(row.get("rate")),
+                "qty": qty,
+                "rate": server_rate,
                 "uom": item.stock_uom,
                 "warehouse": profile.warehouse,
                 **({"description": description} if description else {}),
             },
         )
+        authoritative_lines.append(
+            {"rate": server_rate, "tax_rate": tax_rate}
+        )
+
+    if not _estimate_matches(server_gross, client_gross):
+        frappe.throw(_("Sale total changed. Refresh the catalog and retry the sale."))
 
     doc.set_missing_values()
 
+    # set_missing_values may apply profile taxes or pricing rules. Replace
+    # both with the already resolved company-owned price/tax records.
+    has_tax = any(line["tax_rate"] > 0 for line in authoritative_lines)
+    tax_account = _get_output_tax_account(company) if has_tax else None
+    for invoice_item, line in zip(doc.items, authoritative_lines):
+        invoice_item.price_list_rate = line["rate"]
+        invoice_item.rate = line["rate"]
+        invoice_item.discount_percentage = 0
+        invoice_item.discount_amount = 0
+        invoice_item.item_tax_rate = (
+            json.dumps({tax_account: line["tax_rate"]}) if tax_account else "{}"
+        )
+
+    doc.set("taxes", [])
+    if tax_account:
+        doc.append(
+            "taxes",
+            {
+                "charge_type": "On Net Total",
+                "account_head": tax_account,
+                "description": _("Tax included in selling price"),
+                "rate": 0,
+                "included_in_print_rate": 1,
+            },
+        )
+
+    doc.run_method("calculate_taxes_and_totals")
+
     payments = payload.get("payments") or []
     doc.set("payments", [])
-    if payments:
-        allowed_payment_modes = {
-            row.mode_of_payment for row in profile.payments if row.mode_of_payment
-        }
-        for p in payments:
-            if not isinstance(p, dict):
-                frappe.throw(_("Payment must be an object"))
-            mode = (p.get("mode_of_payment") or "Cash").strip()
-            if mode not in allowed_payment_modes:
-                frappe.throw(
-                    _("Payment mode is not available for this POS Profile"),
-                    frappe.PermissionError,
-                )
-            doc.append(
-                "payments",
-                {
-                    "mode_of_payment": mode,
-                    "amount": flt(p.get("amount")),
-                },
-            )
-    else:
-        # Fall back to a full cash payment for the computed total.
-        doc.run_method("calculate_taxes_and_totals")
-        doc.append(
-            "payments", {"mode_of_payment": "Cash", "amount": flt(doc.grand_total)}
+    if not isinstance(payments, list) or len(payments) > 1:
+        frappe.throw(_("FlexiPOS sales require exactly one payment mode"))
+    allowed_payment_modes = [
+        row.mode_of_payment for row in profile.payments if row.mode_of_payment
+    ]
+    if not allowed_payment_modes:
+        frappe.throw(_("The POS Profile has no payment mode"))
+    payment = payments[0] if payments else {}
+    if not isinstance(payment, dict):
+        frappe.throw(_("Payment must be an object"))
+    mode = (payment.get("mode_of_payment") or allowed_payment_modes[0]).strip()
+    if mode not in allowed_payment_modes:
+        frappe.throw(
+            _("Payment mode is not available for this POS Profile"),
+            frappe.PermissionError,
         )
+    payable = flt(doc.rounded_total or doc.grand_total)
+    doc.append("payments", {"mode_of_payment": mode, "amount": payable})
 
     doc.flags.ignore_permissions = True
     doc.insert()
