@@ -152,6 +152,47 @@ class TestTenantOwnership(FrappeTestCase):
                 {"Drinks": "/files/drinks.png"},
             )
 
+    def test_shared_table_key_is_tenant_scoped(self):
+        self.assertNotEqual(
+            api._table_state_key("Company A", "12"),
+            api._table_state_key("Company B", "12"),
+        )
+
+    def test_shared_table_round_trip_uses_company_owned_document(self):
+        company = frappe.get_all("Company", pluck="name", limit=1)[0]
+        table_no = "__flexipos_test_table__"
+        name = api._table_state_key(company, table_no)
+        if frappe.db.exists("FlexiPOS Table", name):
+            frappe.delete_doc("FlexiPOS Table", name, ignore_permissions=True)
+        try:
+            api._upsert_shared_table(
+                company, table_no, "Occupied", "offline-test", "register-test"
+            )
+            row = frappe.db.get_value(
+                "FlexiPOS Table",
+                name,
+                ["company", "status", "current_offline_invoice_id"],
+                as_dict=True,
+            )
+            self.assertEqual(row.company, company)
+            self.assertEqual(row.status, "Occupied")
+            self.assertEqual(row.current_offline_invoice_id, "offline-test")
+        finally:
+            if frappe.db.exists("FlexiPOS Table", name):
+                frappe.delete_doc("FlexiPOS Table", name, ignore_permissions=True)
+
+    def test_business_config_parses_lists_without_cross_field_defaults(self):
+        values = frappe._dict(
+            flexipos_categories='["Cakes", "Bread"]',
+            flexipos_default_tax_rate=5,
+            flexipos_service_styles="Dine-in,Takeaway",
+        )
+        with patch.object(frappe.db, "get_value", return_value=values):
+            config = api._get_business_config("Company A")
+        self.assertEqual(config["categories"], ["Cakes", "Bread"])
+        self.assertEqual(config["default_tax_rate"], 5)
+        self.assertEqual(config["service_styles"], ["Dine-in", "Takeaway"])
+
 
 class TestAuthoritativePricing(FrappeTestCase):
     def test_price_estimate_tolerance_is_small_and_finite(self):
@@ -236,6 +277,8 @@ class TestEndpointPermissionContract(FrappeTestCase):
     required_guards = {
         "setup_new_business": {"_require_business_setup_access"},
         "sync_inventory": {"_require_any_screen_access"},
+        "save_business_setup": {"_require_screen_access", "_require_admin"},
+        "sync_register_state": {"_require_any_screen_access"},
         "save_item": {"_require_screen_access"},
         "lookup_item_by_barcode": {"_require_any_screen_access"},
         "save_modifier_group": {"_require_screen_access"},
@@ -254,6 +297,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
     ownership_guards = {
         "get_my_business": {"_get_user_company", "_get_pos_profile_for_company"},
         "save_item": {"_require_document_company"},
+        "sync_register_state": {"_get_user_company"},
         "_assign_modifier_groups": {"_require_document_company"},
         "save_modifier_group": {"_require_document_company"},
         "delete_modifier_group": {"_require_document_company"},

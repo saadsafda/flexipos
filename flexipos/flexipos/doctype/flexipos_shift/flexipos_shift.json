@@ -1,0 +1,30 @@
+{
+ "actions": [],
+ "autoname": "field:shift_id",
+ "creation": "2026-07-13 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["shift_id", "company", "register_id", "staff_user", "opening_float", "opened_at", "closed_at", "counted_amount", "status"],
+ "fields": [
+  {"fieldname": "shift_id", "fieldtype": "Data", "hidden": 1, "label": "Shift ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "register_id", "fieldtype": "Data", "in_standard_filter": 1, "label": "Register ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "staff_user", "fieldtype": "Link", "label": "Staff User", "options": "User", "read_only": 1},
+  {"fieldname": "opening_float", "fieldtype": "Currency", "label": "Opening Float", "reqd": 1},
+  {"fieldname": "opened_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Opened At", "reqd": 1},
+  {"fieldname": "closed_at", "fieldtype": "Datetime", "label": "Closed At"},
+  {"fieldname": "counted_amount", "fieldtype": "Currency", "label": "Counted Amount"},
+  {"default": "Open", "fieldname": "status", "fieldtype": "Select", "in_list_view": 1, "label": "Status", "options": "Open\nClosed", "reqd": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-13 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Shift",
+ "owner": "Administrator",
+ "permissions": [{"create": 1, "delete": 1, "read": 1, "role": "System Manager", "write": 1}],
+ "sort_field": "opened_at",
+ "sort_order": "DESC",
+ "states": []
+}

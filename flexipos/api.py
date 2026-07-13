@@ -75,6 +75,7 @@ OFFLINE_ID_FIELD = "flexipos_offline_id"
 ORDER_TYPE_FIELD = "flexipos_order_type"
 TABLE_FIELD = "flexipos_table_no"
 KITCHEN_STATUS_FIELD = "flexipos_kitchen_status"
+REGISTER_ID_FIELD = "flexipos_register_id"
 KITCHEN_STATUSES = ["Placed", "Preparing", "Ready", "Served"]
 PIN_HASH_FIELD = "flexipos_pin_hash"
 DEVICE_ID_FIELD = "flexipos_device_id"
@@ -106,6 +107,9 @@ CATEGORY_IMAGE_FIELD = "flexipos_image"
 # live on Item Group without allowing one tenant to overwrite another's image.
 # Store the category-name -> file URL mapping on Company instead.
 CATEGORY_IMAGES_FIELD = "flexipos_category_images"
+CATEGORY_NAMES_FIELD = "flexipos_categories"
+DEFAULT_TAX_RATE_FIELD = "flexipos_default_tax_rate"
+SERVICE_STYLES_FIELD = "flexipos_service_styles"
 BRANCH_COMPANY_FIELD = "flexipos_company"
 # Niche-specific item flags/badges — cosmetic in the POS UI, but real
 # per-item data (not hardcoded), so a business can turn them on/off per
@@ -222,6 +226,15 @@ def setup_custom_fields():
                     "no_copy": 1,
                     "insert_after": TABLE_FIELD,
                 },
+                {
+                    "fieldname": REGISTER_ID_FIELD,
+                    "label": "FlexiPOS Register ID",
+                    "fieldtype": "Data",
+                    "read_only": 1,
+                    "no_copy": 1,
+                    "search_index": 1,
+                    "insert_after": KITCHEN_STATUS_FIELD,
+                },
             ],
             "Company": [
                 {
@@ -244,6 +257,26 @@ def setup_custom_fields():
                     "hidden": 1,
                     "no_copy": 1,
                     "insert_after": "flexipos_phone",
+                },
+                {
+                    "fieldname": CATEGORY_NAMES_FIELD,
+                    "label": "FlexiPOS Categories (JSON)",
+                    "fieldtype": "Long Text",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": CATEGORY_IMAGES_FIELD,
+                },
+                {
+                    "fieldname": DEFAULT_TAX_RATE_FIELD,
+                    "label": "FlexiPOS Default Tax Rate",
+                    "fieldtype": "Percent",
+                    "insert_after": CATEGORY_NAMES_FIELD,
+                },
+                {
+                    "fieldname": SERVICE_STYLES_FIELD,
+                    "label": "FlexiPOS Service Styles",
+                    "fieldtype": "Data",
+                    "insert_after": DEFAULT_TAX_RATE_FIELD,
                 },
             ],
             "Branch": [
@@ -441,12 +474,11 @@ def _ensure_custom_fields():
     """Create the custom fields on first use if the site hasn't been
     migrated yet. Custom Field writes need admin rights, and the caller
     may be Guest (self-serve signup) — so elevate just for this step."""
-    # Item.flexipos_reorder_point is the newest field; if it exists,
-    # all the older ones do too (they are created together).
+    # These sentinels cover each DocType touched by the setup routine.
     required_fields = (
         ("Item", MADE_TO_ORDER_FIELD),
         ("User", SCREEN_PERMISSIONS_FIELD),
-        ("Company", CATEGORY_IMAGES_FIELD),
+        ("Company", SERVICE_STYLES_FIELD),
         ("Branch", BRANCH_COMPANY_FIELD),
     )
     if all(
@@ -589,6 +621,7 @@ def get_my_business():
     )
     role = _effective_role(user)
     screen_permissions = _screen_permissions_for_user(user, role)
+    config = _get_business_config(company)
     return {
         "company": company,
         "business_type": business_type,
@@ -599,7 +632,85 @@ def get_my_business():
         "currency": profile.currency,
         "warehouse": profile.warehouse,
         "price_list": profile.selling_price_list,
+        **config,
     }
+
+
+def _get_business_config(company):
+    values = frappe.db.get_value(
+        "Company",
+        company,
+        [CATEGORY_NAMES_FIELD, DEFAULT_TAX_RATE_FIELD, SERVICE_STYLES_FIELD],
+        as_dict=True,
+    ) or {}
+    try:
+        categories = json.loads(values.get(CATEGORY_NAMES_FIELD) or "[]")
+    except (TypeError, json.JSONDecodeError):
+        categories = []
+    if not isinstance(categories, list):
+        categories = []
+    styles = [
+        value.strip()
+        for value in (values.get(SERVICE_STYLES_FIELD) or "").split(",")
+        if value.strip() in ("Dine-in", "Takeaway", "Delivery")
+    ]
+    return {
+        "categories": [str(value) for value in categories if value],
+        "default_tax_rate": flt(values.get(DEFAULT_TAX_RATE_FIELD)),
+        "service_styles": styles,
+    }
+
+
+@frappe.whitelist()
+def save_business_setup(categories_json="[]", service_styles_json="[]", default_tax_rate=0, table_count=0):
+    """Persist onboarding fields that must be identical on every register."""
+    _require_screen_access("inventory")
+    _require_admin()
+    company = _get_user_company()
+    categories = _json_list(categories_json, _("categories"))
+    styles = _json_list(service_styles_json, _("service styles"))
+
+    clean_categories = []
+    for value in categories[:100]:
+        name = str(value).strip()[:140]
+        if name and name not in clean_categories:
+            clean_categories.append(name)
+            _ensure_item_group(name)
+
+    clean_styles = []
+    for value in styles:
+        if value in ("Dine-in", "Takeaway", "Delivery") and value not in clean_styles:
+            clean_styles.append(value)
+
+    tax_rate = flt(default_tax_rate)
+    if tax_rate < 0 or tax_rate > 100:
+        frappe.throw(_("Default tax rate must be between 0 and 100"))
+    frappe.db.set_value(
+        "Company",
+        company,
+        {
+            CATEGORY_NAMES_FIELD: json.dumps(clean_categories),
+            SERVICE_STYLES_FIELD: ",".join(clean_styles),
+            DEFAULT_TAX_RATE_FIELD: tax_rate,
+        },
+    )
+
+    count = max(0, min(cint(table_count), 500))
+    for number in range(1, count + 1):
+        _upsert_shared_table(company, str(number), "Free", None, None)
+    return _get_business_config(company)
+
+
+def _json_list(value, label):
+    if isinstance(value, list):
+        return value
+    try:
+        result = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        frappe.throw(_("Invalid {0}").format(label))
+    if not isinstance(result, list):
+        frappe.throw(_("{0} must be a list").format(label))
+    return result
 
 
 def _setup_business(company_name, business_type, phone):
@@ -683,6 +794,9 @@ def _create_company(company_name, business_type, phone):
             "chart_of_accounts": "Standard",
             "flexipos_business_type": business_type,
             "flexipos_phone": phone,
+            CATEGORY_NAMES_FIELD: "[]",
+            DEFAULT_TAX_RATE_FIELD: 0,
+            SERVICE_STYLES_FIELD: "Dine-in,Takeaway" if business_type == "Restaurant" else "",
             "enable_perpetual_inventory": 0,
         }
     )
@@ -940,7 +1054,11 @@ def sync_inventory(last_sync_datetime=None):
         fields=["item_group"],
         limit_page_length=0,
     )
-    category_names = sorted({g.item_group for g in groups if g.item_group})
+    business_config = _get_business_config(company)
+    category_names = sorted(
+        {g.item_group for g in groups if g.item_group}
+        | set(business_config["categories"])
+    )
     company_category_images = _get_company_category_images(company)
     legacy_category_images = {}
     if category_names:
@@ -967,6 +1085,7 @@ def sync_inventory(last_sync_datetime=None):
         "prices": prices,
         "categories": categories,
         "modifier_groups": modifier_groups,
+        "business": business_config,
     }
 
 
@@ -1792,6 +1911,360 @@ def _set_selling_price(item_code, rate, price_list=DEFAULT_PRICE_LIST):
 
 
 # ---------------------------------------------------------------------------
+# 2c. Shared register state
+# ---------------------------------------------------------------------------
+
+def _validate_register_id(register_id, user=None):
+    register_id = (register_id or "").strip()
+    if not register_id or len(register_id) > 140:
+        frappe.throw(_("A valid register ID is required"))
+    assigned = frappe.db.get_value("User", user or frappe.session.user, DEVICE_ID_FIELD)
+    if assigned and assigned != register_id:
+        frappe.throw(_("This register is not assigned to the current user"), frappe.PermissionError)
+    return register_id
+
+
+def _table_state_key(company, table_no):
+    return "TABLE-" + hashlib.sha256(f"{company}\0{table_no}".encode()).hexdigest()[:32]
+
+
+def _upsert_shared_table(company, table_no, status, offline_id, register_id):
+    table_no = (table_no or "").strip()[:140]
+    if not table_no:
+        frappe.throw(_("Table number is required"))
+    status = "Occupied" if str(status).lower() == "occupied" else "Free"
+    name = _table_state_key(company, table_no)
+    if frappe.db.exists("FlexiPOS Table", name):
+        _require_document_company("FlexiPOS Table", name, company)
+        frappe.db.set_value(
+            "FlexiPOS Table",
+            name,
+            {
+                "status": status,
+                "current_offline_invoice_id": offline_id,
+                "register_id": register_id,
+            },
+        )
+    else:
+        frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Table",
+                "state_key": name,
+                "company": company,
+                "table_no": table_no,
+                "status": status,
+                "current_offline_invoice_id": offline_id,
+                "register_id": register_id,
+            }
+        ).insert(ignore_permissions=True)
+
+
+@frappe.whitelist()
+def sync_register_state(register_id, operations_json="[]"):
+    """Merge offline register operations and return the company-wide state."""
+    _require_any_screen_access("quick_sale", "held_orders", "tables", "kitchen", "shift")
+    company = _get_user_company()
+    register_id = _validate_register_id(register_id)
+    operations = _json_list(operations_json, _("register operations"))
+    if len(operations) > 500:
+        frappe.throw(_("Too many register operations in one sync"))
+
+    permissions = set(_screen_permissions_for_user(frappe.session.user))
+    for operation in operations:
+        if not isinstance(operation, dict):
+            frappe.throw(_("Register operation must be an object"))
+        action = operation.get("action")
+        if not isinstance(action, str):
+            frappe.throw(_("Register operation action is required"))
+        payload = operation.get("payload") or {}
+        if not isinstance(payload, dict):
+            frappe.throw(_("Register operation payload must be an object"))
+        if action.startswith("table_"):
+            if not permissions.intersection({"quick_sale", "tables", "kitchen"}):
+                frappe.throw(_("Not permitted to update tables"), frappe.PermissionError)
+            _apply_table_operation(company, register_id, action, payload)
+        elif action.startswith("held_"):
+            if not permissions.intersection({"quick_sale", "held_orders"}):
+                frappe.throw(_("Not permitted to update held orders"), frappe.PermissionError)
+            _apply_held_operation(company, register_id, action, payload)
+        elif action in ("shift_upsert", "movement_upsert"):
+            if "shift" not in permissions:
+                frappe.throw(_("Not permitted to update shifts"), frappe.PermissionError)
+            _apply_shift_operation(company, register_id, action, payload)
+        else:
+            frappe.throw(_("Unknown register operation"))
+
+    return _shared_register_state(company, register_id, include_shift="shift" in permissions)
+
+
+def _apply_table_operation(company, register_id, action, payload):
+    table_no = (payload.get("table_no") or "").strip()
+    if action == "table_upsert":
+        _upsert_shared_table(
+            company,
+            table_no,
+            payload.get("status"),
+            (payload.get("current_offline_invoice_id") or "").strip() or None,
+            register_id,
+        )
+        return
+    if action == "table_delete":
+        name = _table_state_key(company, table_no)
+        if frappe.db.exists("FlexiPOS Table", name):
+            _require_document_company("FlexiPOS Table", name, company)
+            frappe.delete_doc("FlexiPOS Table", name, ignore_permissions=True)
+        return
+    frappe.throw(_("Unknown table operation"))
+
+
+def _apply_held_operation(company, register_id, action, payload):
+    offline_id = (payload.get("id") or "").strip()
+    if not offline_id or len(offline_id) > 140:
+        frappe.throw(_("Held order ID is invalid"))
+    existing = frappe.db.exists("FlexiPOS Held Order", offline_id)
+    if existing:
+        _require_document_company("FlexiPOS Held Order", offline_id, company)
+    if action == "held_delete":
+        if existing:
+            frappe.delete_doc("FlexiPOS Held Order", offline_id, ignore_permissions=True)
+        return
+    if action != "held_upsert":
+        frappe.throw(_("Unknown held-order operation"))
+    lines = payload.get("lines")
+    if not isinstance(lines, list) or not lines or len(lines) > 100:
+        frappe.throw(_("Held order lines are invalid"))
+    values = {
+        "company": company,
+        "register_id": register_id,
+        "staff_name": (payload.get("staff_name") or "").strip()[:140],
+        "order_type": payload.get("order_type") if payload.get("order_type") in ("Dine-in", "Takeaway", "Delivery") else "Dine-in",
+        "table_no": (payload.get("table_no") or "").strip()[:140] or None,
+        "grand_total": flt(payload.get("grand_total")),
+        "item_count": flt(payload.get("item_count")),
+        "lines_json": json.dumps(lines),
+        "held_at": get_datetime(payload.get("held_at") or now_datetime()),
+    }
+    if existing:
+        frappe.db.set_value("FlexiPOS Held Order", offline_id, values)
+    else:
+        frappe.get_doc(
+            {"doctype": "FlexiPOS Held Order", "offline_id": offline_id, **values}
+        ).insert(ignore_permissions=True)
+
+
+def _apply_shift_operation(company, register_id, action, payload):
+    if action == "movement_upsert":
+        movement_id = (payload.get("movement_id") or "").strip()
+        shift_id = (payload.get("shift_id") or "").strip()
+        _require_document_company("FlexiPOS Shift", shift_id, company)
+        shift_register = frappe.db.get_value("FlexiPOS Shift", shift_id, "register_id")
+        if shift_register != register_id:
+            frappe.throw(_("Shift belongs to another register"), frappe.PermissionError)
+        existing = frappe.db.exists("FlexiPOS Cash Movement", movement_id)
+        if existing:
+            _require_document_company("FlexiPOS Cash Movement", movement_id, company)
+            return
+        movement_type = payload.get("type")
+        if movement_type not in ("pay_in", "pay_out") or flt(payload.get("amount")) <= 0:
+            frappe.throw(_("Cash movement is invalid"))
+        frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Cash Movement",
+                "movement_id": movement_id,
+                "company": company,
+                "register_id": register_id,
+                "shift": shift_id,
+                "movement_type": "Pay In" if movement_type == "pay_in" else "Pay Out",
+                "amount": flt(payload.get("amount")),
+                "note": (payload.get("note") or "").strip()[:500],
+                "created_at": get_datetime(payload.get("created_at") or now_datetime()),
+            }
+        ).insert(ignore_permissions=True)
+        return
+
+    shift_id = (payload.get("id") or "").strip()
+    if not shift_id:
+        frappe.throw(_("Shift ID is required"))
+    existing = frappe.db.exists("FlexiPOS Shift", shift_id)
+    if existing:
+        _require_document_company("FlexiPOS Shift", shift_id, company)
+        if frappe.db.get_value("FlexiPOS Shift", shift_id, "register_id") != register_id:
+            frappe.throw(_("Shift belongs to another register"), frappe.PermissionError)
+    status = "Closed" if payload.get("status") == "closed" else "Open"
+    if status == "Open" and not existing and frappe.db.exists(
+        "FlexiPOS Shift", {"company": company, "register_id": register_id, "status": "Open"}
+    ):
+        frappe.throw(_("This register already has an open shift"))
+    values = {
+        "company": company,
+        "register_id": register_id,
+        "staff_user": frappe.session.user,
+        "opening_float": max(flt(payload.get("opening_float")), 0),
+        "opened_at": get_datetime(payload.get("opened_at") or now_datetime()),
+        "closed_at": get_datetime(payload.get("closed_at")) if payload.get("closed_at") else None,
+        "counted_amount": flt(payload.get("counted_amount")) if payload.get("counted_amount") is not None else None,
+        "status": status,
+    }
+    if existing:
+        frappe.db.set_value("FlexiPOS Shift", shift_id, values)
+    else:
+        frappe.get_doc(
+            {"doctype": "FlexiPOS Shift", "shift_id": shift_id, **values}
+        ).insert(ignore_permissions=True)
+
+
+def _shared_register_state(company, register_id, include_shift=False):
+    tables = frappe.get_all(
+        "FlexiPOS Table",
+        filters={"company": company},
+        fields=["table_no", "status", "current_offline_invoice_id", "register_id"],
+        order_by="table_no",
+        limit_page_length=0,
+    )
+    held = frappe.get_all(
+        "FlexiPOS Held Order",
+        filters={"company": company},
+        fields=["offline_id", "order_type", "table_no", "staff_name", "grand_total", "item_count", "lines_json", "held_at", "register_id"],
+        order_by="held_at",
+        limit_page_length=0,
+    )
+    result = {
+        "tables": [
+            {**dict(row), "status": row.status.lower()} for row in tables
+        ],
+        "held_orders": [
+            {
+                "id": row.offline_id,
+                "order_type": row.order_type,
+                "table_no": row.table_no,
+                "staff_name": row.staff_name,
+                "grand_total": flt(row.grand_total),
+                "item_count": flt(row.item_count),
+                "lines": json.loads(row.lines_json or "[]"),
+                "held_at": str(row.held_at),
+                "register_id": row.register_id,
+            }
+            for row in held
+        ],
+        "kitchen_orders": _shared_kitchen_orders(company),
+        "shifts": [],
+        "cash_movements": [],
+    }
+    if include_shift:
+        shifts = frappe.get_all(
+            "FlexiPOS Shift",
+            filters={"company": company, "register_id": register_id},
+            fields=["shift_id", "staff_user", "opening_float", "opened_at", "closed_at", "counted_amount", "status", "register_id"],
+            order_by="opened_at desc",
+            limit_page_length=100,
+        )
+        result["shifts"] = [
+            {
+                "id": row.shift_id,
+                "staff_name": row.staff_user,
+                "register_id": row.register_id,
+                "opening_float": flt(row.opening_float),
+                "opened_at": str(row.opened_at),
+                "closed_at": str(row.closed_at) if row.closed_at else None,
+                "counted_amount": flt(row.counted_amount) if row.counted_amount is not None else None,
+                "status": row.status.lower(),
+            }
+            for row in shifts
+        ]
+        shift_ids = [row.shift_id for row in shifts]
+        movements = frappe.get_all(
+            "FlexiPOS Cash Movement",
+            filters={"shift": ("in", shift_ids)},
+            fields=["movement_id", "shift", "movement_type", "amount", "note", "created_at", "register_id"],
+            order_by="created_at",
+            limit_page_length=0,
+        ) if shift_ids else []
+        result["cash_movements"] = [
+            {
+                "movement_id": row.movement_id,
+                "shift_id": row.shift,
+                "type": "pay_in" if row.movement_type == "Pay In" else "pay_out",
+                "amount": flt(row.amount),
+                "note": row.note,
+                "created_at": str(row.created_at),
+                "register_id": row.register_id,
+            }
+            for row in movements
+        ]
+    return result
+
+
+def _shared_kitchen_orders(company):
+    invoices = frappe.get_all(
+        "Sales Invoice",
+        filters={"company": company, "docstatus": 1, KITCHEN_STATUS_FIELD: ("in", ["Placed", "Preparing", "Ready"])},
+        fields=["name", OFFLINE_ID_FIELD, ORDER_TYPE_FIELD, TABLE_FIELD, KITCHEN_STATUS_FIELD, REGISTER_ID_FIELD, "customer", "posting_date", "posting_time", "net_total", "total_taxes_and_charges", "grand_total", "paid_amount"],
+        order_by="posting_date, posting_time",
+        limit_page_length=0,
+    )
+    if not invoices:
+        return []
+    names = [row.name for row in invoices]
+    item_rows = frappe.get_all(
+        "Sales Invoice Item",
+        filters={"parent": ("in", names), "parenttype": "Sales Invoice"},
+        fields=["parent", "item_code", "item_name", "qty", "rate", "idx"],
+        order_by="parent, idx",
+        limit_page_length=0,
+    )
+    item_codes = {row.item_code for row in item_rows}
+    taxes = {
+        row.name: flt(row.get(TAX_RATE_FIELD))
+        for row in frappe.get_all(
+            "Item",
+            filters={"name": ("in", list(item_codes))},
+            fields=["name", TAX_RATE_FIELD],
+            limit_page_length=0,
+        )
+    } if item_codes else {}
+    by_invoice = {}
+    for row in item_rows:
+        by_invoice.setdefault(row.parent, []).append(
+            {
+                "item_code": row.item_code,
+                "item_name": row.item_name,
+                "qty": flt(row.qty),
+                "rate": flt(row.rate),
+                "tax_rate": taxes.get(row.item_code, 0),
+            }
+        )
+    payments = {
+        row.parent: row.mode_of_payment
+        for row in frappe.get_all(
+            "Sales Invoice Payment",
+            filters={"parent": ("in", names), "parenttype": "Sales Invoice"},
+            fields=["parent", "mode_of_payment"],
+            order_by="parent, idx",
+            limit_page_length=0,
+        )
+    }
+    return [
+        {
+            "offline_invoice_id": row.get(OFFLINE_ID_FIELD) or f"server:{row.name}",
+            "erp_invoice_name": row.name,
+            "customer": row.customer,
+            "posting_datetime": f"{row.posting_date} {row.posting_time}",
+            "order_type": row.get(ORDER_TYPE_FIELD),
+            "table_no": row.get(TABLE_FIELD),
+            "kitchen_status": row.get(KITCHEN_STATUS_FIELD),
+            "register_id": row.get(REGISTER_ID_FIELD),
+            "server_net_total": flt(row.net_total),
+            "server_tax_total": flt(row.total_taxes_and_charges),
+            "server_grand_total": flt(row.grand_total),
+            "paid_amount": flt(row.paid_amount),
+            "payment_mode": payments.get(row.name, "Cash"),
+            "items": by_invoice.get(row.name, []),
+        }
+        for row in invoices
+    ]
+
+
+# ---------------------------------------------------------------------------
 # 3. push_offline_invoices
 # ---------------------------------------------------------------------------
 
@@ -2134,6 +2607,10 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         company,
         user,
     )
+    register_id = (payload.get("register_id") or "").strip()
+    if not register_id:
+        register_id = frappe.db.get_value("User", user, DEVICE_ID_FIELD)
+    register_id = _validate_register_id(register_id, user=user)
 
     requested_customer = (payload.get("customer") or "").strip()
     if requested_customer and requested_customer != profile.customer:
@@ -2188,6 +2665,7 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             ORDER_TYPE_FIELD: order_type,
             TABLE_FIELD: payload.get("table_no"),
             KITCHEN_STATUS_FIELD: kitchen_status,
+            REGISTER_ID_FIELD: register_id,
         }
     )
     branch = (payload.get("branch") or "").strip()
@@ -2331,6 +2809,14 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     doc.flags.ignore_permissions = True
     doc.insert()
     doc.submit()
+    if doc.get(TABLE_FIELD) and order_type == "Dine-in":
+        _upsert_shared_table(
+            company,
+            doc.get(TABLE_FIELD),
+            "Occupied",
+            offline_id,
+            register_id,
+        )
     return doc
 
 
@@ -2355,6 +2841,16 @@ def update_kitchen_status(invoice_name, status):
     frappe.db.set_value(
         "Sales Invoice", invoice_name, KITCHEN_STATUS_FIELD, status, update_modified=False
     )
+    table_no = frappe.db.get_value("Sales Invoice", invoice_name, TABLE_FIELD)
+    if table_no:
+        register_id = frappe.db.get_value("Sales Invoice", invoice_name, REGISTER_ID_FIELD)
+        _upsert_shared_table(
+            company,
+            table_no,
+            "Free" if status == "Served" else "Occupied",
+            None if status == "Served" else frappe.db.get_value("Sales Invoice", invoice_name, OFFLINE_ID_FIELD),
+            register_id,
+        )
     return {"invoice": invoice_name, "kitchen_status": status}
 
 

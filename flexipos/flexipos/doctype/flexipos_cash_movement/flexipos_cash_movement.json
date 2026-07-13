@@ -1,0 +1,29 @@
+{
+ "actions": [],
+ "autoname": "field:movement_id",
+ "creation": "2026-07-13 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["movement_id", "company", "register_id", "shift", "movement_type", "amount", "note", "created_at"],
+ "fields": [
+  {"fieldname": "movement_id", "fieldtype": "Data", "hidden": 1, "label": "Movement ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "register_id", "fieldtype": "Data", "in_standard_filter": 1, "label": "Register ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "shift", "fieldtype": "Link", "in_standard_filter": 1, "label": "Shift", "options": "FlexiPOS Shift", "read_only": 1, "reqd": 1},
+  {"fieldname": "movement_type", "fieldtype": "Select", "label": "Type", "options": "Pay In\nPay Out", "reqd": 1},
+  {"fieldname": "amount", "fieldtype": "Currency", "label": "Amount", "reqd": 1},
+  {"fieldname": "note", "fieldtype": "Small Text", "label": "Note"},
+  {"fieldname": "created_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Created At", "reqd": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-13 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Cash Movement",
+ "owner": "Administrator",
+ "permissions": [{"create": 1, "delete": 1, "read": 1, "role": "System Manager", "write": 1}],
+ "sort_field": "created_at",
+ "sort_order": "ASC",
+ "states": []
+}

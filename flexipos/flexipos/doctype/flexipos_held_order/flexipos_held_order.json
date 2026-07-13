@@ -1,0 +1,31 @@
+{
+ "actions": [],
+ "autoname": "field:offline_id",
+ "creation": "2026-07-13 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["offline_id", "company", "register_id", "staff_name", "order_type", "table_no", "grand_total", "item_count", "lines_json", "held_at"],
+ "fields": [
+  {"fieldname": "offline_id", "fieldtype": "Data", "hidden": 1, "label": "Offline ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "register_id", "fieldtype": "Data", "in_standard_filter": 1, "label": "Register ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "staff_name", "fieldtype": "Data", "label": "Staff"},
+  {"default": "Dine-in", "fieldname": "order_type", "fieldtype": "Select", "label": "Order Type", "options": "Dine-in\nTakeaway\nDelivery"},
+  {"fieldname": "table_no", "fieldtype": "Data", "label": "Table No"},
+  {"fieldname": "grand_total", "fieldtype": "Currency", "label": "Grand Total"},
+  {"fieldname": "item_count", "fieldtype": "Float", "label": "Item Count"},
+  {"fieldname": "lines_json", "fieldtype": "Long Text", "hidden": 1, "label": "Lines JSON", "reqd": 1},
+  {"fieldname": "held_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Held At", "reqd": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-13 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Held Order",
+ "owner": "Administrator",
+ "permissions": [{"create": 1, "delete": 1, "read": 1, "role": "System Manager", "write": 1}],
+ "sort_field": "held_at",
+ "sort_order": "ASC",
+ "states": []
+}
