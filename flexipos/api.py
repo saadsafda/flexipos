@@ -481,6 +481,23 @@ def register_business(business_name, business_type, phone=None, email=None):
     return result
 
 
+def _require_business_setup_access():
+    """Only an authenticated account with no existing tenant may onboard."""
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw(_("Login required"), frappe.AuthenticationError)
+    already_linked = frappe.db.exists(
+        "User Permission", {"user": user, "allow": "Company"}
+    ) or frappe.db.exists(
+        "POS Profile User", {"user": user, "parenttype": "POS Profile"}
+    )
+    if already_linked:
+        frappe.throw(
+            _("This account is already linked to a business"),
+            frappe.PermissionError,
+        )
+
+
 @frappe.whitelist()
 def setup_new_business(company_name, business_type=None, phone=None):
     """Create Company + default Branch + POS Profile for an already
@@ -488,8 +505,7 @@ def setup_new_business(company_name, business_type=None, phone=None):
     company_name = (company_name or "").strip()
     if not company_name:
         frappe.throw(_("Business name is required"))
-    if frappe.session.user == "Guest":
-        frappe.throw(_("Login required"), frappe.AuthenticationError)
+    _require_business_setup_access()
     if frappe.db.exists("Company", {"company_name": company_name}):
         frappe.throw(_("A business named {0} already exists").format(company_name))
 
@@ -531,12 +547,12 @@ def get_my_business():
     business_type = frappe.db.get_value(
         "Company", profile.company, "flexipos_business_type"
     )
-    role = frappe.db.get_value("User", user, ROLE_FIELD)
-    screen_permissions = _screen_permissions_for_user(user, role or ADMIN_ROLE)
+    role = _effective_role(user)
+    screen_permissions = _screen_permissions_for_user(user, role)
     return {
         "company": profile.company,
         "business_type": business_type,
-        "role": role or ADMIN_ROLE,
+        "role": role,
         "screen_permissions": screen_permissions,
         "pos_profile": profile.name,
         "customer": profile.customer,
@@ -737,6 +753,7 @@ def sync_inventory(last_sync_datetime=None):
     change does not touch Item.modified. The client merges prices into
     its local item rows by item_code.
     """
+    _require_any_screen_access("quick_sale", "inventory")
     _ensure_custom_fields()
     company = _get_user_company()
     server_time = str(now_datetime())
@@ -930,6 +947,7 @@ def save_item(item_json):
     Returns the same row shape sync_inventory uses (plus price) so the
     client can upsert its local cache immediately.
     """
+    _require_screen_access("inventory")
     data = item_json
     if isinstance(data, str):
         try:
@@ -1195,6 +1213,7 @@ def _set_primary_barcode(item, barcode):
 def lookup_item_by_barcode(barcode):
     """Scan-to-add: resolve a scanned/typed barcode to an item_code within
     the caller's business. Returns None if no item has that barcode."""
+    _require_any_screen_access("quick_sale", "inventory")
     company = _get_user_company()
     barcode = (barcode or "").strip()
     if not barcode:
@@ -1278,6 +1297,7 @@ def save_modifier_group(group_json):
           ]
         }
     """
+    _require_screen_access("inventory")
     data = group_json
     if isinstance(data, str):
         try:
@@ -1386,6 +1406,7 @@ def delete_modifier_group(name):
     first (past invoices are unaffected either way, since a chosen
     modifier is baked into the invoice line's rate/description, not a
     live reference)."""
+    _require_screen_access("inventory")
     company = _get_user_company()
     owner = frappe.db.get_value("FlexiPOS Modifier Group", name, "flexipos_company")
     if owner is None:
@@ -1413,6 +1434,7 @@ def upload_image(target_type, target_name, filename, content_base64):
     """Attach a public photo to a product (Item.image) or a category
     (Item Group.flexipos_image). Base64 payload keeps the client simple
     and identical across mobile/desktop/web."""
+    _require_screen_access("inventory")
     _ensure_custom_fields()
     company = _get_user_company()
 
@@ -1571,6 +1593,7 @@ def push_offline_invoices(invoices_json):
     and confirmed on the next sync (the unique offline id makes the
     retry a no-op duplicate).
     """
+    _require_screen_access("quick_sale")
     invoices = invoices_json
     if isinstance(invoices, str):
         try:
@@ -1777,6 +1800,7 @@ def update_kitchen_status(invoice_name, status):
     primarily in the device's local SQLite; this endpoint just mirrors
     it back to the Sales Invoice so other devices/reports can see it.
     """
+    _require_screen_access("kitchen")
     status = (status or "").strip()
     if status not in KITCHEN_STATUSES:
         frappe.throw(_("Invalid kitchen status"))
@@ -1818,6 +1842,7 @@ def process_refund(invoice_name, items_json, reason=None):
     requested item/qty exceeds what was actually sold (accounting for
     any prior partial refunds against the same invoice).
     """
+    _require_screen_access("order_history")
     items = items_json
     if isinstance(items, str):
         try:
@@ -1948,6 +1973,7 @@ def get_order_history(limit=100):
     """Recent submitted orders for the caller's business, newest first,
     with refund status derived from any credit notes against them —
     for the Order History & Refunds screen."""
+    _require_screen_access("order_history")
     company = _get_user_company()
     invoices = frappe.get_all(
         "Sales Invoice",
@@ -2094,12 +2120,12 @@ def verify_pin_login(pin, device_id):
 
     frappe.cache().delete_value(cache_key)
     frappe.local.login_manager.login_as(user.name)
-    role = frappe.db.get_value("User", user.name, ROLE_FIELD)
+    role = _effective_role(user.name)
     return {
         "user": user.name,
         "full_name": frappe.db.get_value("User", user.name, "full_name"),
-        "role": role or ADMIN_ROLE,
-        "screen_permissions": _screen_permissions_for_user(user.name, role or ADMIN_ROLE),
+        "role": role,
+        "screen_permissions": _screen_permissions_for_user(user.name, role),
         "sid": frappe.session.sid,
         **_get_api_credentials(user.name),
     }
@@ -2114,10 +2140,9 @@ def _hash_pin(pin, salt):
 # ---------------------------------------------------------------------------
 # Staff are ordinary Frappe Users scoped to the business via the same
 # User Permission mechanism used everywhere else for tenant isolation —
-# no custom "Staff" DocType. Role is a freeform label (flexipos_role)
-# rather than a Frappe Role, since it's just a display/grouping concept
-# today (e.g. "Chef", "Waiter") and not yet wired to real permission
-# scoping — see the memory note on this being a UI-first pass.
+# no custom "Staff" DocType. Role remains a business-facing label
+# (Chef, Waiter, Cashier, etc.); authorization is enforced by the
+# screen-permission guards below on every business-data endpoint.
 
 def _default_screen_permissions(role):
     if role == ADMIN_ROLE:
@@ -2135,8 +2160,35 @@ def _default_screen_permissions(role):
     return ["quick_sale"]
 
 
+def _is_company_owner(user, company=None):
+    """Whether ``user`` is the recorded creator of their Company.
+
+    Older FlexiPOS owners may predate the explicit Admin role field. The
+    Company owner is the only safe legacy fallback; an arbitrary linked
+    user with no role must never inherit Admin access.
+    """
+    if not user or user == "Guest":
+        return False
+    if not company:
+        company = frappe.db.get_value(
+            "User Permission", {"user": user, "allow": "Company"}, "for_value"
+        )
+    return (
+        bool(company)
+        and frappe.db.get_value("Company", company, "owner") == user
+    )
+
+
+def _effective_role(user):
+    """Resolve a role without treating every missing value as Admin."""
+    role = frappe.db.get_value("User", user, ROLE_FIELD)
+    if role:
+        return role
+    return ADMIN_ROLE if _is_company_owner(user) else "Staff"
+
+
 def _screen_permissions_for_user(user, role=None):
-    role = role or frappe.db.get_value("User", user, ROLE_FIELD) or ADMIN_ROLE
+    role = role or _effective_role(user)
     if role == ADMIN_ROLE:
         return sorted(ALL_SCREEN_PERMISSIONS)
     raw = frappe.db.get_value("User", user, SCREEN_PERMISSIONS_FIELD)
@@ -2151,8 +2203,35 @@ def _screen_permissions_for_user(user, role=None):
 
 
 def _require_screen_access(permission):
-    if permission not in _screen_permissions_for_user(frappe.session.user):
-        frappe.throw(_("You do not have access to this screen"), frappe.PermissionError)
+    _require_any_screen_access(permission)
+
+
+def _require_any_screen_access(*permissions):
+    """Require at least one server-side screen capability.
+
+    Flutter route visibility is only presentation. Every whitelisted
+    business-data method calls this guard so a hidden screen cannot be
+    bypassed by invoking the HTTP API directly.
+    """
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw(_("Login required"), frappe.AuthenticationError)
+
+    requested = {
+        value for value in permissions if value in ALL_SCREEN_PERMISSIONS
+    }
+    if not requested:
+        frappe.throw(
+            _("Invalid permission configuration"), frappe.PermissionError
+        )
+
+    granted = set(_screen_permissions_for_user(user))
+    if requested.isdisjoint(granted):
+        frappe.throw(
+            _("You do not have permission to perform this action"),
+            frappe.PermissionError,
+        )
+
 
 @frappe.whitelist()
 def list_staff():
@@ -2160,6 +2239,7 @@ def list_staff():
     _ensure_custom_fields()
     company = _get_user_company()
     _require_screen_access("staff")
+    _require_admin(company)
 
     user_names = frappe.get_all(
         "User Permission",
@@ -2181,13 +2261,13 @@ def list_staff():
                 "user": r.name,
                 "full_name": r.full_name,
                 "email": r.email,
-                "role": r.get(ROLE_FIELD) or ADMIN_ROLE,
+                "role": _effective_role(r.name),
                 "has_device": bool(r.get(DEVICE_ID_FIELD)),
                 "enabled": r.enabled,
                 "last_active": str(r.last_active) if r.last_active else None,
                 "is_you": r.name == frappe.session.user,
                 "screen_permissions": _screen_permissions_for_user(
-                    r.name, r.get(ROLE_FIELD) or ADMIN_ROLE
+                    r.name, _effective_role(r.name)
                 ),
             }
             for r in rows
@@ -2203,6 +2283,7 @@ def add_staff(full_name, role, pin, email=None, screen_permissions=None):
     _ensure_custom_fields()
     company = _get_user_company()
     _require_screen_access("staff")
+    _require_admin(company)
 
     full_name = (full_name or "").strip()
     role = (role or "").strip()
@@ -2340,6 +2421,7 @@ def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enab
     _ensure_custom_fields()
     company = _get_user_company()
     _require_screen_access("staff")
+    _require_admin(company)
     _require_staff_of_company(user, company)
 
     email = (email or "").strip().lower()
@@ -2391,6 +2473,7 @@ def remove_staff(user):
     _ensure_custom_fields()
     company = _get_user_company()
     _require_screen_access("staff")
+    _require_admin(company)
     _require_staff_of_company(user, company)
     if user == frappe.session.user:
         frappe.throw(_("You cannot remove your own account"))
@@ -2404,8 +2487,16 @@ def _require_admin(company):
     (the one who ran register_business) always has ADMIN_ROLE implicitly
     even if flexipos_role was never set, so onboarding doesn't lock
     itself out."""
-    role = frappe.db.get_value("User", frappe.session.user, ROLE_FIELD)
-    if role and role != ADMIN_ROLE:
+    user = frappe.session.user
+    role = _effective_role(user)
+    if role != ADMIN_ROLE or not (
+        frappe.db.get_value(
+            "User Permission",
+            {"user": user, "allow": "Company", "for_value": company},
+            "name",
+        )
+        or _is_company_owner(user, company)
+    ):
         frappe.throw(_("Only an Admin can manage staff"), frappe.PermissionError)
 
 
