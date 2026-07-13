@@ -25,6 +25,8 @@ hooks.py as:  after_install = "flexipos.api.setup_custom_fields"):
     Sales Invoice.flexipos_kitchen_status
     Company.flexipos_business_type
     Company.flexipos_phone
+    Company.flexipos_category_images
+    Branch.flexipos_company
     User.flexipos_pin_hash
     User.flexipos_device_id
     Item.flexipos_company
@@ -99,6 +101,11 @@ MODIFIER_GROUPS_FIELD = "flexipos_modifier_groups"
 # Stock ERPNext Item Group has no dependable image field, so category
 # photos live in our own Attach Image custom field.
 CATEGORY_IMAGE_FIELD = "flexipos_image"
+# Item Groups are shared ERPNext masters, so writable category images cannot
+# live on Item Group without allowing one tenant to overwrite another's image.
+# Store the category-name -> file URL mapping on Company instead.
+CATEGORY_IMAGES_FIELD = "flexipos_category_images"
+BRANCH_COMPANY_FIELD = "flexipos_company"
 # Niche-specific item flags/badges — cosmetic in the POS UI, but real
 # per-item data (not hardcoded), so a business can turn them on/off per
 # product like any other field.
@@ -227,6 +234,26 @@ def setup_custom_fields():
                     "fieldtype": "Data",
                     "insert_after": "flexipos_business_type",
                 },
+                {
+                    "fieldname": CATEGORY_IMAGES_FIELD,
+                    "label": "FlexiPOS Category Images (JSON)",
+                    "fieldtype": "Long Text",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": "flexipos_phone",
+                },
+            ],
+            "Branch": [
+                {
+                    "fieldname": BRANCH_COMPANY_FIELD,
+                    "label": "FlexiPOS Company",
+                    "fieldtype": "Link",
+                    "options": "Company",
+                    "read_only": 1,
+                    "no_copy": 1,
+                    "search_index": 1,
+                    "insert_after": "branch",
+                }
             ],
             "Item": [
                 {
@@ -391,6 +418,21 @@ def setup_custom_fields():
         update_modified=False,
     )
 
+    # Backfill the deterministic main branches created by older FlexiPOS
+    # versions. Never overwrite an existing owner stamp.
+    for company in frappe.get_all("Company", fields=["name"], limit_page_length=0):
+        branch_name = f"{company.name} - Main"
+        if frappe.db.exists("Branch", branch_name) and not frappe.db.get_value(
+            "Branch", branch_name, BRANCH_COMPANY_FIELD
+        ):
+            frappe.db.set_value(
+                "Branch",
+                branch_name,
+                BRANCH_COMPANY_FIELD,
+                company.name,
+                update_modified=False,
+            )
+
 
 def _ensure_custom_fields():
     """Create the custom fields on first use if the site hasn't been
@@ -398,10 +440,17 @@ def _ensure_custom_fields():
     may be Guest (self-serve signup) — so elevate just for this step."""
     # Item.flexipos_reorder_point is the newest field; if it exists,
     # all the older ones do too (they are created together).
-    if frappe.db.exists(
-        "Custom Field", {"dt": "Item", "fieldname": MADE_TO_ORDER_FIELD}
-    ) and frappe.db.exists(
-        "Custom Field", {"dt": "User", "fieldname": SCREEN_PERMISSIONS_FIELD}
+    required_fields = (
+        ("Item", MADE_TO_ORDER_FIELD),
+        ("User", SCREEN_PERMISSIONS_FIELD),
+        ("Company", CATEGORY_IMAGES_FIELD),
+        ("Branch", BRANCH_COMPANY_FIELD),
+    )
+    if all(
+        frappe.db.exists(
+            "Custom Field", {"dt": doctype, "fieldname": fieldname}
+        )
+        for doctype, fieldname in required_fields
     ):
         return
     original_user = frappe.session.user
@@ -530,27 +579,15 @@ def get_my_business():
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Login required"), frappe.AuthenticationError)
-
-    profile_name = frappe.db.get_value("POS Profile User", {"user": user}, "parent")
-    if not profile_name:
-        company = frappe.db.get_value(
-            "User Permission", {"user": user, "allow": "Company"}, "for_value"
-        )
-        if company:
-            profile_name = frappe.db.get_value(
-                "POS Profile", {"company": company, "disabled": 0}, "name"
-            )
-    if not profile_name:
-        frappe.throw(_("No business is linked to this account yet"))
-
-    profile = frappe.get_cached_doc("POS Profile", profile_name)
+    company = _get_user_company()
+    profile = _get_pos_profile_for_company(None, company, user)
     business_type = frappe.db.get_value(
         "Company", profile.company, "flexipos_business_type"
     )
     role = _effective_role(user)
     screen_permissions = _screen_permissions_for_user(user, role)
     return {
-        "company": profile.company,
+        "company": company,
         "business_type": business_type,
         "role": role,
         "screen_permissions": screen_permissions,
@@ -653,8 +690,25 @@ def _create_company(company_name, business_type, phone):
 def _create_branch(company):
     branch_name = f"{company.name} - Main"
     if frappe.db.exists("Branch", branch_name):
-        return frappe.get_doc("Branch", branch_name)
-    branch = frappe.get_doc({"doctype": "Branch", "branch": branch_name})
+        branch = frappe.get_doc("Branch", branch_name)
+        owner = branch.get(BRANCH_COMPANY_FIELD)
+        if owner and owner != company.name:
+            frappe.throw(
+                _("The default branch belongs to another business"),
+                frappe.PermissionError,
+            )
+        if not owner:
+            branch.set(BRANCH_COMPANY_FIELD, company.name)
+            branch.flags.ignore_permissions = True
+            branch.save()
+        return branch
+    branch = frappe.get_doc(
+        {
+            "doctype": "Branch",
+            "branch": branch_name,
+            BRANCH_COMPANY_FIELD: company.name,
+        }
+    )
     branch.insert(ignore_permissions=True)
     return branch
 
@@ -882,17 +936,25 @@ def sync_inventory(last_sync_datetime=None):
         limit_page_length=0,
     )
     category_names = sorted({g.item_group for g in groups if g.item_group})
-    categories = []
+    company_category_images = _get_company_category_images(company)
+    legacy_category_images = {}
     if category_names:
-        rows = frappe.get_all(
+        legacy_rows = frappe.get_all(
             "Item Group",
             filters={"name": ("in", category_names)},
             fields=["name", CATEGORY_IMAGE_FIELD],
         )
-        categories = sorted(
-            ({"name": r.name, "image": r.get(CATEGORY_IMAGE_FIELD)} for r in rows),
-            key=lambda c: c["name"],
-        )
+        legacy_category_images = {
+            row.name: row.get(CATEGORY_IMAGE_FIELD) for row in legacy_rows
+        }
+    categories = [
+        {
+            "name": name,
+            "image": company_category_images.get(name)
+            or legacy_category_images.get(name),
+        }
+        for name in category_names
+    ]
 
     return {
         "server_time": server_time,
@@ -977,12 +1039,13 @@ def save_item(item_json):
     barcode = (data.get("barcode") or "").strip() or None
 
     if item_code:
-        owner = frappe.db.get_value("Item", item_code, COMPANY_FIELD)
-        if owner != company:
-            frappe.throw(
-                _("This product belongs to another business"),
-                frappe.PermissionError,
-            )
+        _require_document_company(
+            "Item",
+            item_code,
+            company,
+            company_field=COMPANY_FIELD,
+            label=_("Product"),
+        )
         item = frappe.get_doc("Item", item_code)
         item.item_name = item_name
         item.item_group = item_group
@@ -1239,14 +1302,13 @@ def _assign_modifier_groups(item, company, group_names):
         frappe.throw(_("modifier_groups must be a list"))
 
     for name in group_names:
-        owner = frappe.db.get_value("FlexiPOS Modifier Group", name, "flexipos_company")
-        if owner is None:
-            frappe.throw(_("Modifier group {0} does not exist").format(name))
-        if owner != company:
-            frappe.throw(
-                _("Modifier group {0} belongs to another business").format(name),
-                frappe.PermissionError,
-            )
+        _require_document_company(
+            "FlexiPOS Modifier Group",
+            name,
+            company,
+            company_field="flexipos_company",
+            label=_("Modifier group"),
+        )
 
     item.set(MODIFIER_GROUPS_FIELD, [{"modifier_group": name} for name in group_names])
     item.flags.ignore_permissions = True
@@ -1326,19 +1388,19 @@ def save_modifier_group(group_json):
         modifier_id = (opt.get("modifier") or "").strip()
         label = (opt.get("label") or "").strip()
         if modifier_id:
+            _require_document_company(
+                "FlexiPOS Modifier",
+                modifier_id,
+                company,
+                company_field="flexipos_company",
+                label=_("Modifier"),
+            )
             modifier = frappe.db.get_value(
                 "FlexiPOS Modifier",
                 modifier_id,
                 ["flexipos_company", "modifier_name"],
                 as_dict=True,
             )
-            if not modifier:
-                frappe.throw(_("Modifier {0} does not exist").format(modifier_id))
-            if modifier.flexipos_company != company:
-                frappe.throw(
-                    _("Modifier {0} belongs to another business").format(modifier_id),
-                    frappe.PermissionError,
-                )
             label = modifier.modifier_name
         elif label:
             modifier_id = _get_or_create_modifier(company, label, flt(opt.get("price")))
@@ -1357,14 +1419,13 @@ def save_modifier_group(group_json):
 
     existing_name = (data.get("name") or "").strip()
     if existing_name:
-        owner = frappe.db.get_value(
-            "FlexiPOS Modifier Group", existing_name, "flexipos_company"
+        _require_document_company(
+            "FlexiPOS Modifier Group",
+            existing_name,
+            company,
+            company_field="flexipos_company",
+            label=_("Modifier group"),
         )
-        if owner != company:
-            frappe.throw(
-                _("This modifier group belongs to another business"),
-                frappe.PermissionError,
-            )
         group = frappe.get_doc("FlexiPOS Modifier Group", existing_name)
         group.group_name = group_name
     else:
@@ -1408,14 +1469,13 @@ def delete_modifier_group(name):
     live reference)."""
     _require_screen_access("inventory")
     company = _get_user_company()
-    owner = frappe.db.get_value("FlexiPOS Modifier Group", name, "flexipos_company")
-    if owner is None:
-        frappe.throw(_("Modifier group {0} does not exist").format(name))
-    if owner != company:
-        frappe.throw(
-            _("This modifier group belongs to another business"),
-            frappe.PermissionError,
-        )
+    _require_document_company(
+        "FlexiPOS Modifier Group",
+        name,
+        company,
+        company_field="flexipos_company",
+        label=_("Modifier group"),
+    )
 
     in_use = frappe.get_all(
         "FlexiPOS Item Modifier Group",
@@ -1451,57 +1511,215 @@ def upload_image(target_type, target_name, filename, content_base64):
     if len(raw) > MAX_IMAGE_BYTES:
         frappe.throw(_("Image is too large (max 3 MB)"))
 
+    category_images = None
     if target_type == "item":
-        if frappe.db.get_value("Item", target_name, COMPANY_FIELD) != company:
+        _require_document_company(
+            "Item",
+            target_name,
+            company,
+            company_field=COMPANY_FIELD,
+            label=_("Product"),
+        )
+        doctype, attached_name, fieldname = "Item", target_name, "image"
+    elif target_type == "category":
+        category_is_owned = frappe.db.exists(
+            "Item",
+            {
+                COMPANY_FIELD: company,
+                "item_group": target_name,
+            },
+        )
+        if not frappe.db.exists("Item Group", target_name) or not category_is_owned:
             frappe.throw(
-                _("This product belongs to another business"),
+                _("Category is not available for this business"),
                 frappe.PermissionError,
             )
-        doctype, fieldname = "Item", "image"
-    elif target_type == "category":
-        if not frappe.db.exists("Item Group", target_name):
-            frappe.throw(_("Category {0} does not exist").format(target_name))
-        doctype, fieldname = "Item Group", CATEGORY_IMAGE_FIELD
+        category_images = _get_company_category_images(company)
+        doctype, attached_name, fieldname = "Company", company, None
     else:
         frappe.throw(_("target_type must be 'item' or 'category'"))
 
-    file_doc = frappe.get_doc(
-        {
-            "doctype": "File",
-            "file_name": filename,
-            "attached_to_doctype": doctype,
-            "attached_to_name": target_name,
-            "attached_to_field": fieldname,
-            "is_private": 0,
-            "content": content_base64,
-            "decode": True,
-        }
-    )
+    file_data = {
+        "doctype": "File",
+        "file_name": filename,
+        "attached_to_doctype": doctype,
+        "attached_to_name": attached_name,
+        "is_private": 0,
+        "content": content_base64,
+        "decode": True,
+    }
+    if fieldname:
+        file_data["attached_to_field"] = fieldname
+    file_doc = frappe.get_doc(file_data)
     file_doc.flags.ignore_permissions = True
     file_doc.insert(ignore_permissions=True)
 
-    # Bumping `modified` lets delta sync carry the new image to other
-    # devices of the same business.
-    frappe.db.set_value(doctype, target_name, fieldname, file_doc.file_url)
+    if target_type == "category":
+        category_images[target_name] = file_doc.file_url
+        frappe.db.set_value(
+            "Company",
+            company,
+            CATEGORY_IMAGES_FIELD,
+            json.dumps(category_images, sort_keys=True),
+        )
+    else:
+        # Bumping `modified` lets delta sync carry the new image to other
+        # devices of the same business.
+        frappe.db.set_value("Item", target_name, "image", file_doc.file_url)
 
     return {"image": file_doc.file_url}
 
 
+def _get_company_category_images(company):
+    raw = frappe.db.get_value("Company", company, CATEGORY_IMAGES_FIELD)
+    if not raw:
+        return {}
+    try:
+        values = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(name): str(url)
+        for name, url in values.items()
+        if name and isinstance(url, str) and url
+    }
+
+
+def _require_document_company(
+    doctype,
+    name,
+    company,
+    *,
+    company_field="company",
+    label=None,
+):
+    """Reject a missing or cross-tenant Link without leaking its owner."""
+    label = label or doctype
+    owner = (
+        frappe.db.get_value(doctype, name, company_field)
+        if name
+        else None
+    )
+    if owner != company:
+        frappe.throw(
+            _("{0} is not available for this business").format(label),
+            frappe.PermissionError,
+        )
+    return name
+
+
 def _get_user_company():
-    """Resolve the single company the session user belongs to."""
+    """Resolve exactly one company from all of the user's tenant links."""
     user = frappe.session.user
     if user == "Guest":
         frappe.throw(_("Login required"), frappe.AuthenticationError)
-    company = frappe.db.get_value(
-        "User Permission", {"user": user, "allow": "Company"}, "for_value"
+
+    companies = set(
+        frappe.get_all(
+            "User Permission",
+            filters={"user": user, "allow": "Company"},
+            pluck="for_value",
+            limit_page_length=0,
+        )
     )
-    if not company:
-        profile = frappe.db.get_value("POS Profile User", {"user": user}, "parent")
-        if profile:
-            company = frappe.db.get_value("POS Profile", profile, "company")
-    if not company:
+    profile_names = frappe.get_all(
+        "POS Profile User",
+        filters={"user": user, "parenttype": "POS Profile"},
+        pluck="parent",
+        limit_page_length=0,
+    )
+    if profile_names:
+        companies.update(
+            frappe.get_all(
+                "POS Profile",
+                filters={"name": ("in", profile_names)},
+                pluck="company",
+                limit_page_length=0,
+            )
+        )
+    companies.discard(None)
+    companies.discard("")
+
+    if not companies:
         frappe.throw(_("No business is linked to this account yet"))
+    if len(companies) != 1:
+        frappe.throw(
+            _("This account has conflicting business assignments"),
+            frappe.PermissionError,
+        )
+    company = next(iter(companies))
+    if not frappe.db.exists("Company", company):
+        frappe.throw(_("The linked business no longer exists"))
     return company
+
+
+def _get_pos_profile_for_company(profile_name, company, user):
+    """Resolve an enabled POS Profile assigned to ``user`` and ``company``."""
+    if profile_name:
+        _require_document_company(
+            "POS Profile", profile_name, company, label=_("POS Profile")
+        )
+        assigned = frappe.db.exists(
+            "POS Profile User",
+            {
+                "parent": profile_name,
+                "parenttype": "POS Profile",
+                "user": user,
+            },
+        )
+        if not assigned:
+            frappe.throw(
+                _("POS Profile is not assigned to this user"),
+                frappe.PermissionError,
+            )
+    else:
+        assigned_profiles = frappe.get_all(
+            "POS Profile User",
+            filters={
+                "user": user,
+                "parenttype": "POS Profile",
+            },
+            pluck="parent",
+            limit_page_length=0,
+        )
+        candidates = (
+            frappe.get_all(
+                "POS Profile",
+                filters={
+                    "name": ("in", assigned_profiles),
+                    "company": company,
+                    "disabled": 0,
+                },
+                pluck="name",
+                order_by="creation asc",
+                limit_page_length=1,
+            )
+            if assigned_profiles
+            else []
+        )
+        profile_name = candidates[0] if candidates else None
+
+    if not profile_name:
+        frappe.throw(_("No assigned POS Profile found for this business"))
+
+    profile = frappe.get_cached_doc("POS Profile", profile_name)
+    if profile.company != company or profile.disabled:
+        frappe.throw(
+            _("POS Profile is not available for this business"),
+            frappe.PermissionError,
+        )
+    if not profile.customer or not frappe.db.exists("Customer", profile.customer):
+        frappe.throw(_("The POS Profile has no valid customer"))
+    if not profile.selling_price_list or not frappe.db.exists(
+        "Price List", profile.selling_price_list
+    ):
+        frappe.throw(_("The POS Profile has no valid selling price list"))
+    _require_document_company(
+        "Warehouse", profile.warehouse, company, label=_("Warehouse")
+    )
+    return profile
 
 
 def _ensure_item_group(name):
@@ -1635,6 +1853,15 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
     so a single bad invoice cannot poison the batch."""
     results = []
     for payload in invoices:
+        if not isinstance(payload, dict):
+            results.append(
+                {
+                    "offline_invoice_id": None,
+                    "status": "failed",
+                    "error": "Invoice payload must be an object",
+                }
+            )
+            continue
         offline_id = (payload.get("offline_invoice_id") or "").strip()
         if not offline_id:
             results.append(
@@ -1657,7 +1884,12 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
             continue
 
         existing = frappe.db.get_value(
-            "Sales Invoice", {OFFLINE_ID_FIELD: offline_id}, "name"
+            "Sales Invoice",
+            {
+                OFFLINE_ID_FIELD: offline_id,
+                "company": allowed_company,
+            },
+            "name",
         )
         if existing:
             results.append(
@@ -1672,7 +1904,12 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
         savepoint = "flexipos_invoice"
         frappe.db.savepoint(savepoint)
         try:
-            doc = _create_pos_invoice(payload, offline_id)
+            doc = _create_pos_invoice(
+                payload,
+                offline_id,
+                user=user,
+                allowed_company=allowed_company,
+            )
             results.append(
                 {
                     "offline_invoice_id": offline_id,
@@ -1698,21 +1935,43 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
     return results
 
 
-def _create_pos_invoice(payload, offline_id):
-    company = payload.get("company")
-    if not company:
-        frappe.throw(_("company is required"))
+def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
+    company = (payload.get("company") or "").strip()
+    if not company or company != allowed_company:
+        frappe.throw(
+            _("Company is not available for this user"),
+            frappe.PermissionError,
+        )
 
-    pos_profile_name = payload.get("pos_profile") or frappe.db.get_value(
-        "POS Profile", {"company": company, "disabled": 0}, "name"
+    profile = _get_pos_profile_for_company(
+        (payload.get("pos_profile") or "").strip() or None,
+        company,
+        user,
     )
-    if not pos_profile_name:
-        frappe.throw(_("No POS Profile found for company {0}").format(company))
-    profile = frappe.get_cached_doc("POS Profile", pos_profile_name)
+
+    requested_customer = (payload.get("customer") or "").strip()
+    if requested_customer and requested_customer != profile.customer:
+        frappe.throw(
+            _("Customer is not available for this POS Profile"),
+            frappe.PermissionError,
+        )
 
     items = payload.get("items") or []
-    if not items:
+    if not isinstance(items, list) or not items:
         frappe.throw(_("Invoice has no items"))
+
+    item_codes = {
+        (row.get("item_code") or "").strip()
+        for row in items
+        if isinstance(row, dict) and row.get("item_code")
+    }
+    item_rows = frappe.get_all(
+        "Item",
+        filters={"name": ("in", list(item_codes))},
+        fields=["name", COMPANY_FIELD, "disabled", "stock_uom"],
+        limit_page_length=0,
+    ) if item_codes else []
+    owned_items = {row.name: row for row in item_rows}
 
     posting = get_datetime(payload.get("posting_datetime") or now_datetime())
     order_type = payload.get("order_type")
@@ -1724,7 +1983,7 @@ def _create_pos_invoice(payload, offline_id):
     doc.update(
         {
             "company": company,
-            "customer": payload.get("customer") or profile.customer or WALK_IN_CUSTOMER,
+            "customer": profile.customer,
             "is_pos": 1,
             "pos_profile": profile.name,
             "set_posting_time": 1,
@@ -1739,10 +1998,31 @@ def _create_pos_invoice(payload, offline_id):
             KITCHEN_STATUS_FIELD: kitchen_status,
         }
     )
-    if payload.get("branch"):
-        doc.branch = payload["branch"]
+    branch = (payload.get("branch") or "").strip()
+    if branch:
+        if not frappe.get_meta("Sales Invoice").has_field("branch"):
+            frappe.throw(_("Branch accounting is not enabled for Sales Invoice"))
+        _require_document_company(
+            "Branch",
+            branch,
+            company,
+            company_field=BRANCH_COMPANY_FIELD,
+            label=_("Branch"),
+        )
+        doc.branch = branch
 
     for row in items:
+        if not isinstance(row, dict):
+            frappe.throw(_("Invoice item must be an object"))
+        item_code = (row.get("item_code") or "").strip()
+        item = owned_items.get(item_code)
+        if not item or item.get(COMPANY_FIELD) != company:
+            frappe.throw(
+                _("Item is not available for this business"),
+                frappe.PermissionError,
+            )
+        if item.disabled:
+            frappe.throw(_("Item {0} is disabled").format(item_code))
         modifiers = row.get("modifiers") or []
         description = (
             ", ".join(
@@ -1757,10 +2037,10 @@ def _create_pos_invoice(payload, offline_id):
         doc.append(
             "items",
             {
-                "item_code": row.get("item_code"),
+                "item_code": item_code,
                 "qty": flt(row.get("qty")) or 1,
                 "rate": flt(row.get("rate")),
-                "uom": row.get("uom"),
+                "uom": item.stock_uom,
                 "warehouse": profile.warehouse,
                 **({"description": description} if description else {}),
             },
@@ -1771,11 +2051,22 @@ def _create_pos_invoice(payload, offline_id):
     payments = payload.get("payments") or []
     doc.set("payments", [])
     if payments:
+        allowed_payment_modes = {
+            row.mode_of_payment for row in profile.payments if row.mode_of_payment
+        }
         for p in payments:
+            if not isinstance(p, dict):
+                frappe.throw(_("Payment must be an object"))
+            mode = (p.get("mode_of_payment") or "Cash").strip()
+            if mode not in allowed_payment_modes:
+                frappe.throw(
+                    _("Payment mode is not available for this POS Profile"),
+                    frappe.PermissionError,
+                )
             doc.append(
                 "payments",
                 {
-                    "mode_of_payment": p.get("mode_of_payment") or "Cash",
+                    "mode_of_payment": mode,
                     "amount": flt(p.get("amount")),
                 },
             )
@@ -1806,11 +2097,9 @@ def update_kitchen_status(invoice_name, status):
         frappe.throw(_("Invalid kitchen status"))
 
     company = _get_user_company()
-    owner = frappe.db.get_value("Sales Invoice", invoice_name, "company")
-    if not owner:
-        frappe.throw(_("Order not found"))
-    if owner != company:
-        frappe.throw(_("This order belongs to another business"), frappe.PermissionError)
+    _require_document_company(
+        "Sales Invoice", invoice_name, company, label=_("Order")
+    )
 
     frappe.db.set_value(
         "Sales Invoice", invoice_name, KITCHEN_STATUS_FIELD, status, update_modified=False
@@ -1853,16 +2142,24 @@ def process_refund(invoice_name, items_json, reason=None):
         frappe.throw(_("Select at least one item to refund"))
 
     company = _get_user_company()
+    _require_document_company(
+        "Sales Invoice", invoice_name, company, label=_("Order")
+    )
     original = frappe.get_doc("Sales Invoice", invoice_name)
-    if original.company != company:
-        frappe.throw(_("This order belongs to another business"), frappe.PermissionError)
     if original.docstatus != 1:
         frappe.throw(_("Only submitted orders can be refunded"))
     if original.is_return:
         frappe.throw(_("This is already a credit note"))
+    if original.pos_profile:
+        _require_document_company(
+            "POS Profile",
+            original.pos_profile,
+            company,
+            label=_("POS Profile"),
+        )
 
     sold_qty = {row.item_code: flt(row.qty) for row in original.items}
-    already_refunded = _refunded_qty_by_item(invoice_name)
+    already_refunded = _refunded_qty_by_item(invoice_name, company)
 
     return_rows = []
     for row in items:
@@ -1872,6 +2169,13 @@ def process_refund(invoice_name, items_json, reason=None):
         qty = flt(row.get("qty"))
         if not item_code or qty <= 0:
             continue
+        _require_document_company(
+            "Item",
+            item_code,
+            company,
+            company_field=COMPANY_FIELD,
+            label=_("Item"),
+        )
         available = sold_qty.get(item_code, 0) - already_refunded.get(item_code, 0)
         if qty > available:
             frappe.throw(
@@ -1908,6 +2212,13 @@ def process_refund(invoice_name, items_json, reason=None):
     refund_total = 0.0
     for item_code, qty in return_rows:
         source_row = original_rows[item_code]
+        if source_row.warehouse:
+            _require_document_company(
+                "Warehouse",
+                source_row.warehouse,
+                company,
+                label=_("Warehouse"),
+            )
         credit_note.append(
             "items",
             {
@@ -1944,13 +2255,18 @@ def process_refund(invoice_name, items_json, reason=None):
     }
 
 
-def _refunded_qty_by_item(invoice_name):
+def _refunded_qty_by_item(invoice_name, company):
     """Sum of already-refunded quantities per item across every credit
     note issued against this invoice, so repeated partial refunds can't
     together exceed what was sold."""
     credit_notes = frappe.get_all(
         "Sales Invoice",
-        filters={"return_against": invoice_name, "docstatus": 1, "is_return": 1},
+        filters={
+            "return_against": invoice_name,
+            "company": company,
+            "docstatus": 1,
+            "is_return": 1,
+        },
         pluck="name",
     )
     if not credit_notes:
@@ -2120,14 +2436,13 @@ def verify_pin_login(pin, device_id):
 
     frappe.cache().delete_value(cache_key)
     frappe.local.login_manager.login_as(user.name)
-    role = _effective_role(user.name)
+    business = get_my_business()
     return {
         "user": user.name,
         "full_name": frappe.db.get_value("User", user.name, "full_name"),
-        "role": role,
-        "screen_permissions": _screen_permissions_for_user(user.name, role),
         "sid": frappe.session.sid,
         **_get_api_credentials(user.name),
+        **business,
     }
 
 
@@ -2501,11 +2816,19 @@ def _require_admin(company):
 
 
 def _require_staff_of_company(user, company):
-    owner = frappe.db.get_value(
-        "User Permission", {"user": user, "allow": "Company"}, "for_value"
+    belongs_to_company = frappe.db.exists(
+        "User Permission",
+        {
+            "user": user,
+            "allow": "Company",
+            "for_value": company,
+        },
     )
-    if owner != company:
-        frappe.throw(_("This staff member belongs to another business"), frappe.PermissionError)
+    if not frappe.db.exists("User", user) or not belongs_to_company:
+        frappe.throw(
+            _("Staff member is not available for this business"),
+            frappe.PermissionError,
+        )
 
 
 # ---------------------------------------------------------------------------
