@@ -3816,8 +3816,8 @@ def register_device_pin(pin, device_id):
     the current user, enabling verify_pin_login afterwards."""
     pin = (pin or "").strip()
     device_id = (device_id or "").strip()
-    if not pin.isdigit() or not 4 <= len(pin) <= 6:
-        frappe.throw(_("PIN must be 4-6 digits"))
+    if not pin.isdigit() or len(pin) != 4:
+        frappe.throw(_("PIN must be exactly 4 digits"))
     if not device_id:
         frappe.throw(_("device_id is required"))
 
@@ -3842,6 +3842,8 @@ def verify_pin_login(pin, device_id):
     device_id = (device_id or "").strip()
     if not pin or not device_id:
         frappe.throw(_("PIN and device_id are required"), frappe.AuthenticationError)
+    if not pin.isdigit() or len(pin) != 4:
+        frappe.throw(_("Invalid PIN"), frappe.AuthenticationError)
 
     cache_key = f"flexipos_pin_attempts:{device_id}"
     attempts = cint(frappe.cache().get_value(cache_key))
@@ -4048,8 +4050,8 @@ def add_staff(full_name, role, pin, email=None, screen_permissions=None):
         frappe.throw(_("Name is required"))
     if not role:
         frappe.throw(_("Role is required"))
-    if not pin.isdigit() or not 4 <= len(pin) <= 6:
-        frappe.throw(_("PIN must be 4-6 digits"))
+    if not pin.isdigit() or len(pin) != 4:
+        frappe.throw(_("PIN must be exactly 4 digits"))
 
     email = (email or "").strip().lower()
     if not email:
@@ -4195,8 +4197,8 @@ def update_staff(user, full_name=None, email=None, role=None, new_pin=None, enab
         updates[ROLE_FIELD] = role.strip()
     if new_pin is not None and new_pin != "":
         pin = new_pin.strip()
-        if not pin.isdigit() or not 4 <= len(pin) <= 6:
-            frappe.throw(_("PIN must be 4-6 digits"))
+        if not pin.isdigit() or len(pin) != 4:
+            frappe.throw(_("PIN must be exactly 4 digits"))
         salt = secrets.token_hex(16)
         updates[PIN_HASH_FIELD] = f"{salt}${_hash_pin(pin, salt)}"
     if enabled is not None:
@@ -4329,8 +4331,8 @@ def verify_login_otp(email, otp, device_id, new_pin):
 
     if not otp or not device_id:
         frappe.throw(_("Code and device_id are required"))
-    if not new_pin.isdigit() or not 4 <= len(new_pin) <= 6:
-        frappe.throw(_("PIN must be 4-6 digits"))
+    if not new_pin.isdigit() or len(new_pin) != 4:
+        frappe.throw(_("PIN must be exactly 4 digits"))
 
     attempts_key = f"flexipos_otp_verify:{email}"
     _rate_limit(attempts_key, MAX_OTP_ATTEMPTS, 600)
