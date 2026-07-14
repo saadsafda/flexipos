@@ -1347,8 +1347,8 @@ def _get_business_config(company):
 def save_business_setup(categories_json="[]", service_styles_json="[]", default_tax_rate=0, table_count=0):
     """Persist onboarding fields that must be identical on every register."""
     _require_screen_access("inventory")
-    _require_admin()
     company = _get_user_company()
+    _require_admin(company)
     categories = _json_list(categories_json, _("categories"))
     styles = _json_list(service_styles_json, _("service styles"))
 
