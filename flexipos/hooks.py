@@ -144,23 +144,11 @@ after_migrate = "flexipos.api.setup_custom_fields"
 # Scheduled Tasks
 # ---------------
 
-# scheduler_events = {
-# 	"all": [
-# 		"flexipos.tasks.all"
-# 	],
-# 	"daily": [
-# 		"flexipos.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"flexipos.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"flexipos.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"flexipos.tasks.monthly"
-# 	],
-# }
+scheduler_events = {
+    "daily": [
+        "flexipos.tasks.run_subscription_lifecycle",
+    ],
+}
 
 # Testing
 # -------
@@ -250,4 +238,3 @@ after_migrate = "flexipos.api.setup_custom_fields"
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-

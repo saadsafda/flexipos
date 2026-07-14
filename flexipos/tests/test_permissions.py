@@ -72,6 +72,83 @@ class TestScreenPermissionGuards(FrappeTestCase):
             api._require_business_setup_access()
 
 
+class TestSubscriptionLifecycle(FrappeTestCase):
+    def test_expired_trial_is_marked_past_due(self):
+        values = frappe._dict(
+            flexipos_subscription_status="Trialing",
+            flexipos_trial_ends_on=frappe.utils.add_to_date(
+                frappe.utils.now_datetime(), days=-1
+            ),
+            flexipos_current_period_end=None,
+            flexipos_billing_provider=None,
+            flexipos_billing_plan=None,
+            flexipos_billing_email=None,
+            flexipos_deletion_requested_at=None,
+            flexipos_retention_until=None,
+        )
+        with (
+            patch.object(frappe.db, "get_value", return_value=values),
+            patch.object(frappe.db, "set_value") as set_value,
+        ):
+            subscription = api._subscription_payload("Company A")
+        self.assertEqual(subscription["status"], "Past Due")
+        set_value.assert_called_once()
+
+    def test_non_operational_subscription_is_blocked(self):
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(
+                api,
+                "_subscription_payload",
+                return_value={"status": "Past Due"},
+            ),
+        ):
+            with self.assertRaises(frappe.PermissionError):
+                api._require_subscription_access()
+
+    def test_client_payload_is_normalized_for_flutter(self):
+        with patch.object(
+            api,
+            "_subscription_payload",
+            return_value={
+                "status": "Past Due",
+                "plan": "monthly",
+                "billing_provider": "safepay",
+                "trial_ends_on": None,
+                "current_period_end": None,
+                "billing_setup_required": True,
+            },
+        ):
+            payload = api._subscription_client_payload("Company A")
+        self.assertEqual(payload["subscription_status"], "past_due")
+        self.assertTrue(payload["billing_setup_required"])
+
+    def test_cross_tenant_controls_require_site_administrator(self):
+        previous = frappe.session.user
+        try:
+            frappe.set_user("Guest")
+            with self.assertRaises(frappe.PermissionError):
+                api._require_saas_operator()
+        finally:
+            frappe.set_user(previous)
+
+    def test_client_cannot_register_its_own_payment_token(self):
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_require_admin"),
+            patch.object(frappe.db, "set_value") as set_value,
+        ):
+            with self.assertRaises(frappe.PermissionError):
+                api.start_billing_checkout(
+                    "monthly",
+                    provider="safepay",
+                    billing_email="owner@example.com",
+                    customer_token="client-supplied-token",
+                    privacy_consent=True,
+                )
+        set_value.assert_not_called()
+
+
 class TestTenantOwnership(FrappeTestCase):
     def setUp(self):
         self.previous_user = frappe.session.user
@@ -497,6 +574,21 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "verify_pin_login",
         "request_login_otp",
         "verify_login_otp",
+        "get_subscription",
+        "get_subscription_status",
+        "start_billing_checkout",
+        "create_billing_checkout",
+        "admin_set_subscription",
+        "cancel_subscription",
+        "billing_webhook",
+        "request_data_export",
+        "request_data_deletion",
+        "request_account_deletion",
+        "cancel_data_deletion",
+        "saas_list_tenants",
+        "saas_set_default_trial_days",
+        "saas_extend_trial",
+        "saas_set_tenant_status",
     }
 
     required_guards: ClassVar[dict[str, set[str]]] = {

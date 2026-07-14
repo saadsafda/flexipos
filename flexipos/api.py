@@ -50,6 +50,7 @@ lookup_item_by_barcode.
 
 import base64
 import hashlib
+import hmac
 import json
 import math
 import secrets
@@ -180,6 +181,27 @@ OTP_TTL_SECONDS = 600
 MAX_OTP_REQUESTS = 3  # per email per 15 minutes
 MAX_OTP_ATTEMPTS = 5  # wrong codes per email per 10 minutes
 
+# SaaS account lifecycle.  Payment gateways are intentionally not coupled to
+# these values: PayFast, bank transfer, Easypaisa/JazzCash, or a card gateway
+# can all drive the same state through the signed billing webhook below.
+SUBSCRIPTION_STATUS_FIELD = "flexipos_subscription_status"
+TRIAL_ENDS_FIELD = "flexipos_trial_ends_on"
+CURRENT_PERIOD_END_FIELD = "flexipos_current_period_end"
+BILLING_PROVIDER_FIELD = "flexipos_billing_provider"
+BILLING_CUSTOMER_FIELD = "flexipos_billing_customer_token"
+BILLING_PLAN_FIELD = "flexipos_billing_plan"
+BILLING_EMAIL_FIELD = "flexipos_billing_email"
+BILLING_EVENT_FIELD = "flexipos_billing_last_event_id"
+DELETION_REQUESTED_FIELD = "flexipos_deletion_requested_at"
+RETENTION_UNTIL_FIELD = "flexipos_retention_until"
+PRIVACY_CONSENT_FIELD = "flexipos_privacy_consent_at"
+SUBSCRIPTION_STATUSES = ["Trialing", "Active", "Past Due", "Suspended", "Cancelled", "Archived"]
+DEFAULT_TRIAL_DAYS = 7
+DEFAULT_RETENTION_DAYS = 30
+OPERATIONAL_SUBSCRIPTION_STATUSES = {"Trialing", "Active"}
+DEFAULT_TRIAL_DAYS_KEY = "flexipos_default_trial_days"
+MAX_TRIAL_EXTENSION_DAYS = 365
+
 
 # ---------------------------------------------------------------------------
 # Installation helper
@@ -277,6 +299,88 @@ def setup_custom_fields():
                     "label": "FlexiPOS Service Styles",
                     "fieldtype": "Data",
                     "insert_after": DEFAULT_TAX_RATE_FIELD,
+                },
+                {
+                    "fieldname": SUBSCRIPTION_STATUS_FIELD,
+                    "label": "FlexiPOS Subscription Status",
+                    "fieldtype": "Select",
+                    "options": "\n" + "\n".join(SUBSCRIPTION_STATUSES),
+                    "default": "Active",
+                    "read_only": 1,
+                    "search_index": 1,
+                    "insert_after": SERVICE_STYLES_FIELD,
+                },
+                {
+                    "fieldname": TRIAL_ENDS_FIELD,
+                    "label": "FlexiPOS Trial Ends On",
+                    "fieldtype": "Datetime",
+                    "read_only": 1,
+                    "insert_after": SUBSCRIPTION_STATUS_FIELD,
+                },
+                {
+                    "fieldname": CURRENT_PERIOD_END_FIELD,
+                    "label": "FlexiPOS Current Period End",
+                    "fieldtype": "Datetime",
+                    "read_only": 1,
+                    "insert_after": TRIAL_ENDS_FIELD,
+                },
+                {
+                    "fieldname": BILLING_PROVIDER_FIELD,
+                    "label": "FlexiPOS Billing Provider",
+                    "fieldtype": "Data",
+                    "insert_after": CURRENT_PERIOD_END_FIELD,
+                },
+                {
+                    "fieldname": BILLING_CUSTOMER_FIELD,
+                    "label": "FlexiPOS Billing Customer Token",
+                    "fieldtype": "Data",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": BILLING_PROVIDER_FIELD,
+                },
+                {
+                    "fieldname": BILLING_PLAN_FIELD,
+                    "label": "FlexiPOS Billing Plan",
+                    "fieldtype": "Data",
+                    "insert_after": BILLING_CUSTOMER_FIELD,
+                },
+                {
+                    "fieldname": BILLING_EMAIL_FIELD,
+                    "label": "FlexiPOS Billing Email",
+                    "fieldtype": "Data",
+                    "insert_after": BILLING_PLAN_FIELD,
+                },
+                {
+                    "fieldname": BILLING_EVENT_FIELD,
+                    "label": "FlexiPOS Last Billing Event ID",
+                    "fieldtype": "Data",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": BILLING_EMAIL_FIELD,
+                },
+                {
+                    "fieldname": DELETION_REQUESTED_FIELD,
+                    "label": "FlexiPOS Deletion Requested At",
+                    "fieldtype": "Datetime",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": BILLING_EVENT_FIELD,
+                },
+                {
+                    "fieldname": RETENTION_UNTIL_FIELD,
+                    "label": "FlexiPOS Retention Until",
+                    "fieldtype": "Date",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": DELETION_REQUESTED_FIELD,
+                },
+                {
+                    "fieldname": PRIVACY_CONSENT_FIELD,
+                    "label": "FlexiPOS Privacy Consent At",
+                    "fieldtype": "Datetime",
+                    "hidden": 1,
+                    "no_copy": 1,
+                    "insert_after": RETENTION_UNTIL_FIELD,
                 },
             ],
             "Branch": [
@@ -479,6 +583,7 @@ def _ensure_custom_fields():
         ("Item", MADE_TO_ORDER_FIELD),
         ("User", SCREEN_PERMISSIONS_FIELD),
         ("Company", SERVICE_STYLES_FIELD),
+        ("Company", SUBSCRIPTION_STATUS_FIELD),
         ("Branch", BRANCH_COMPANY_FIELD),
     )
     if all(
@@ -622,6 +727,7 @@ def get_my_business():
     role = _effective_role(user)
     screen_permissions = _screen_permissions_for_user(user, role)
     config = _get_business_config(company)
+    subscription = _subscription_payload(company)
     return {
         "company": company,
         "business_type": business_type,
@@ -633,7 +739,508 @@ def get_my_business():
         "warehouse": profile.warehouse,
         "price_list": profile.selling_price_list,
         **config,
+        "subscription": subscription,
+        **_subscription_client_payload(company),
     }
+
+
+def _subscription_payload(company):
+    """Return safe subscription metadata (never card/PAN or gateway secrets)."""
+    values = frappe.db.get_value(
+        "Company",
+        company,
+        [SUBSCRIPTION_STATUS_FIELD, TRIAL_ENDS_FIELD, CURRENT_PERIOD_END_FIELD,
+         BILLING_PROVIDER_FIELD, BILLING_PLAN_FIELD, BILLING_EMAIL_FIELD,
+         DELETION_REQUESTED_FIELD, RETENTION_UNTIL_FIELD],
+        as_dict=True,
+    ) or {}
+    status = values.get(SUBSCRIPTION_STATUS_FIELD) or "Active"
+    now = now_datetime()
+    trial_end = values.get(TRIAL_ENDS_FIELD)
+    period_end = values.get(CURRENT_PERIOD_END_FIELD)
+    require_billing_setup = cint(frappe.conf.get("flexipos_require_card_on_signup"))
+    has_payment_token = bool(frappe.db.get_value("Company", company, BILLING_CUSTOMER_FIELD))
+    if status == "Trialing" and trial_end and get_datetime(trial_end) <= now:
+        status = "Past Due"
+        frappe.db.set_value("Company", company, SUBSCRIPTION_STATUS_FIELD, status, update_modified=False)
+    elif status == "Active" and period_end and get_datetime(period_end) <= now:
+        status = "Past Due"
+        frappe.db.set_value("Company", company, SUBSCRIPTION_STATUS_FIELD, status, update_modified=False)
+    return {
+        "status": status,
+        "trial_ends_on": str(trial_end) if trial_end else None,
+        "current_period_end": str(period_end) if period_end else None,
+        "billing_provider": values.get(BILLING_PROVIDER_FIELD) or None,
+        "plan": values.get(BILLING_PLAN_FIELD) or None,
+        "billing_email": values.get(BILLING_EMAIL_FIELD) or None,
+        "deletion_requested_at": str(values.get(DELETION_REQUESTED_FIELD)) if values.get(DELETION_REQUESTED_FIELD) else None,
+        "retention_until": str(values.get(RETENTION_UNTIL_FIELD)) if values.get(RETENTION_UNTIL_FIELD) else None,
+        "trial_days": _default_trial_days(),
+        "billing_setup_required": bool(require_billing_setup and not has_payment_token),
+    }
+
+
+def _default_trial_days():
+    """Site-wide trial length for future tenants, bounded defensively."""
+    configured = frappe.db.get_default(DEFAULT_TRIAL_DAYS_KEY)
+    days = DEFAULT_TRIAL_DAYS if configured in (None, "") else cint(configured)
+    return max(0, min(days, 90))
+
+
+def _subscription_client_payload(company):
+    """Stable flattened contract consumed by Flutter login/session flows."""
+    value = _subscription_payload(company)
+    status_key = value["status"].lower().replace(" ", "_")
+    tenant_status = "suspended" if value["status"] == "Suspended" else (
+        "archived" if value["status"] == "Archived" else "active"
+    )
+    return {
+        "subscription_status": status_key,
+        "subscription_plan": value.get("plan"),
+        "billing_provider": value.get("billing_provider"),
+        "trial_ends_at": value.get("trial_ends_on"),
+        "subscription_ends_at": value.get("current_period_end"),
+        "tenant_status": tenant_status,
+        "billing_setup_required": value.get("billing_setup_required", False),
+    }
+
+
+def _require_subscription_access(company=None):
+    """Block business mutations/reads after trial or billing expiry.
+
+    Legacy companies with no lifecycle field are treated as Active so a
+    migration cannot unexpectedly lock an existing merchant out.
+    """
+    company = company or _get_user_company()
+    subscription = _subscription_payload(company)
+    if subscription["status"] not in OPERATIONAL_SUBSCRIPTION_STATUSES:
+        frappe.throw(
+            _("This business subscription is {0}. Update billing to continue.").format(subscription["status"]),
+            frappe.PermissionError,
+        )
+    return subscription
+
+
+@frappe.whitelist()
+def get_subscription():
+    """Return the current tenant lifecycle state for the billing screen."""
+    if frappe.session.user == "Guest":
+        frappe.throw(_("Login required"), frappe.AuthenticationError)
+    company = _get_user_company()
+    subscription = _subscription_payload(company)
+    return {
+        "company": company,
+        "subscription": subscription,
+        **_subscription_client_payload(company),
+    }
+
+
+@frappe.whitelist()
+def get_subscription_status():
+    """Compatibility name used by the billing UI."""
+    return get_subscription()
+
+
+def _require_saas_operator():
+    """Reserve cross-tenant controls for the Frappe site Administrator."""
+    if frappe.session.user != "Administrator":
+        frappe.throw(_("Only the SaaS operator can manage tenant lifecycle"), frappe.PermissionError)
+
+
+def _audit_saas_action(action, company=None, details=None):
+    """Write an operator audit record without payment credentials or PII."""
+    try:
+        frappe.get_doc(
+            {
+                "doctype": "Activity Log",
+                "subject": f"FlexiPOS SaaS: {action}"[:140],
+                "status": "Success",
+                "user": frappe.session.user,
+                "reference_doctype": "Company" if company else None,
+                "reference_name": company,
+                "full_name": frappe.session.user,
+                "ip_address": getattr(frappe.local, "request_ip", None),
+                "timeline_doctype": "Company" if company else None,
+                "timeline_name": company,
+                "content": json.dumps(details or {}, default=str),
+            }
+        ).insert(ignore_permissions=True)
+    except Exception:
+        # Lifecycle state changes must not fail merely because a site has a
+        # customised Activity Log schema. Keep a server-side error trail.
+        frappe.log_error(frappe.get_traceback(), "FlexiPOS SaaS audit failed")
+
+
+@frappe.whitelist()
+def saas_list_tenants(limit=200, start=0):
+    """Cross-tenant operational view for the site Administrator."""
+    _require_saas_operator()
+    limit = max(1, min(cint(limit), 500))
+    start = max(0, cint(start))
+    rows = frappe.get_all(
+        "Company",
+        fields=["name", "company_name", SUBSCRIPTION_STATUS_FIELD, TRIAL_ENDS_FIELD,
+                CURRENT_PERIOD_END_FIELD, BILLING_PROVIDER_FIELD, BILLING_PLAN_FIELD,
+                DELETION_REQUESTED_FIELD, RETENTION_UNTIL_FIELD],
+        order_by="creation desc",
+        limit_start=start,
+        limit_page_length=limit,
+    )
+    return {
+        "tenants": [
+            {"company": row.name, "company_name": row.company_name, **_subscription_payload(row.name)}
+            for row in rows
+        ],
+        "default_trial_days": _default_trial_days(),
+        "start": start,
+        "limit": limit,
+    }
+
+
+@frappe.whitelist()
+def saas_set_default_trial_days(days):
+    """Change the default trial length for businesses created afterwards."""
+    _require_saas_operator()
+    days = cint(days)
+    if days < 0 or days > 90:
+        frappe.throw(_("Default trial days must be between 0 and 90"))
+    frappe.db.set_default(DEFAULT_TRIAL_DAYS_KEY, days)
+    _audit_saas_action("default trial changed", details={"days": days})
+    return {"default_trial_days": days}
+
+
+@frappe.whitelist()
+def saas_extend_trial(days, company=None, all_companies=0):
+    """Extend one tenant or every eligible tenant from its current end date.
+
+    This is deliberately additive: extending an unexpired 7-day trial by 3
+    days produces 10 total days. Expired trials restart from the current UTC
+    time. Archived/deletion-pending tenants are never revived in bulk.
+    """
+    _require_saas_operator()
+    days = cint(days)
+    if days < 1 or days > MAX_TRIAL_EXTENSION_DAYS:
+        frappe.throw(_("Trial extension must be between 1 and {0} days").format(MAX_TRIAL_EXTENSION_DAYS))
+    if cint(all_companies):
+        companies = frappe.get_all(
+            "Company",
+            filters={SUBSCRIPTION_STATUS_FIELD: ("in", ["Trialing", "Past Due", "Cancelled"])},
+            pluck="name",
+            limit_page_length=0,
+        )
+    else:
+        company = (company or "").strip()
+        if not company or not frappe.db.exists("Company", company):
+            frappe.throw(_("A valid company is required"))
+        if frappe.db.get_value("Company", company, SUBSCRIPTION_STATUS_FIELD) == "Archived":
+            frappe.throw(_("Archived tenants cannot receive a trial extension"), frappe.PermissionError)
+        if frappe.db.get_value("Company", company, DELETION_REQUESTED_FIELD):
+            frappe.throw(_("Cancel the deletion request before extending this trial"), frappe.PermissionError)
+        companies = [company]
+
+    now = now_datetime()
+    updated = []
+    for name in companies:
+        if frappe.db.get_value("Company", name, DELETION_REQUESTED_FIELD):
+            continue
+        current_end = frappe.db.get_value("Company", name, TRIAL_ENDS_FIELD)
+        base = get_datetime(current_end) if current_end and get_datetime(current_end) > now else now
+        new_end = add_to_date(base, days=days)
+        frappe.db.set_value(
+            "Company",
+            name,
+            {SUBSCRIPTION_STATUS_FIELD: "Trialing", TRIAL_ENDS_FIELD: new_end},
+            update_modified=False,
+        )
+        updated.append({"company": name, "trial_ends_at": str(new_end)})
+        if not cint(all_companies):
+            _audit_saas_action("trial extended", name, {"days": days, "trial_ends_at": str(new_end)})
+    if cint(all_companies):
+        _audit_saas_action("bulk trial extension", details={"days": days, "tenant_count": len(updated)})
+    return {"updated": updated, "count": len(updated), "days_added": days}
+
+
+@frappe.whitelist()
+def saas_set_tenant_status(company, status, current_period_end=None, reason=None):
+    """Suspend, reactivate, cancel, or archive a specific tenant centrally."""
+    _require_saas_operator()
+    company = (company or "").strip()
+    status = (status or "").strip().title()
+    if not frappe.db.exists("Company", company):
+        frappe.throw(_("Unknown business"), frappe.PermissionError)
+    if status not in SUBSCRIPTION_STATUSES:
+        frappe.throw(_("Invalid subscription status"))
+    values = {SUBSCRIPTION_STATUS_FIELD: status}
+    if current_period_end:
+        period_end = get_datetime(current_period_end)
+        if period_end <= now_datetime():
+            frappe.throw(_("The subscription period end must be in the future"))
+        values[CURRENT_PERIOD_END_FIELD] = period_end
+    elif status == "Active" and not frappe.db.get_value("Company", company, CURRENT_PERIOD_END_FIELD):
+        frappe.throw(_("An active tenant needs a future subscription period end"))
+    frappe.db.set_value("Company", company, values, update_modified=False)
+    _audit_saas_action("tenant status changed", company, {"status": status, "reason": (reason or "")[:240]})
+    return {"company": company, "subscription": _subscription_payload(company)}
+
+
+@frappe.whitelist()
+def start_billing_checkout(plan, provider=None, billing_email=None, customer_token=None, privacy_consent=False):
+    """Save a provider-neutral billing intent.
+
+    The app must never receive card numbers/CVV. ``customer_token`` is an
+    opaque gateway token is accepted only from the gateway's signed webhook.
+    The webhook activates the plan after a successful setup/charge; this
+    endpoint deliberately does not grant access.
+    """
+    company = _get_user_company()
+    _require_admin(company)
+    provider = (provider or frappe.conf.get("flexipos_billing_provider") or "safepay").strip().lower()
+    plan = (plan or "").strip()[:80]
+    billing_email = (billing_email or frappe.session.user or "").strip().lower()
+    if not provider or not plan:
+        frappe.throw(_("Billing provider and plan are required"))
+    if billing_email:
+        validate_email_address(billing_email, throw=True)
+    if not cint(privacy_consent):
+        frappe.throw(_("Privacy consent is required before billing"))
+    if customer_token:
+        frappe.throw(
+            _("Payment tokens can only be registered by a verified billing webhook"),
+            frappe.PermissionError,
+        )
+    frappe.db.set_value(
+        "Company", company,
+        {
+            BILLING_PROVIDER_FIELD: provider,
+            BILLING_PLAN_FIELD: plan,
+            BILLING_EMAIL_FIELD: billing_email,
+            # Consent is recorded only after the user explicitly accepts the
+            # privacy notice alongside hosted billing checkout.
+            PRIVACY_CONSENT_FIELD: now_datetime(),
+        },
+        update_modified=False,
+    )
+    return {
+        "company": company,
+        "provider": provider,
+        "plan": plan,
+        "status": _subscription_payload(company)["status"],
+        "checkout_required": True,
+        "card_data_storage": "never",
+    }
+
+
+@frappe.whitelist()
+def create_billing_checkout(plan, provider=None, billing_email=None, customer_token=None, privacy_consent=False):
+    """Compatibility name for clients calling the checkout endpoint."""
+    return start_billing_checkout(plan, provider, billing_email, customer_token, privacy_consent)
+
+
+@frappe.whitelist()
+def admin_set_subscription(status, current_period_end=None, plan=None):
+    """Manual billing control for PayFast/manual bank settlement operations."""
+    company = _get_user_company()
+    _require_admin(company)
+    status = (status or "").strip().title()
+    if status not in SUBSCRIPTION_STATUSES:
+        frappe.throw(_("Invalid subscription status"))
+    period_end = get_datetime(current_period_end) if current_period_end else None
+    if status == "Active" and (not period_end or period_end <= now_datetime()):
+        frappe.throw(_("An active subscription needs a future period end"))
+    values = {SUBSCRIPTION_STATUS_FIELD: status}
+    if period_end:
+        values[CURRENT_PERIOD_END_FIELD] = period_end
+    if plan is not None:
+        values[BILLING_PLAN_FIELD] = str(plan).strip()[:80]
+    frappe.db.set_value("Company", company, values, update_modified=False)
+    return {"company": company, "subscription": _subscription_payload(company)}
+
+
+@frappe.whitelist()
+def cancel_subscription():
+    company = _get_user_company()
+    _require_admin(company)
+    frappe.db.set_value("Company", company, SUBSCRIPTION_STATUS_FIELD, "Cancelled", update_modified=False)
+    return {"company": company, "subscription": _subscription_payload(company)}
+
+
+def _contains_raw_card_data(value):
+    forbidden = {"card_number", "cardnumber", "pan", "cvv", "cvc", "security_code"}
+    if isinstance(value, dict):
+        return any(
+            str(key).lower().replace("-", "_") in forbidden
+            or _contains_raw_card_data(child)
+            for key, child in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_raw_card_data(child) for child in value)
+    return False
+
+
+@frappe.whitelist()
+def billing_webhook(provider, event_id, event_type, company, status, signature, payload_json="{}"):
+    """Consume an idempotent, HMAC-signed gateway event.
+
+    Configure ``flexipos_billing_webhook_secret`` in site_config.json. The
+    canonical JSON payload is signed with HMAC-SHA256. Webhook handlers only
+    store opaque customer tokens; raw card data is rejected by design.
+    """
+    secret = frappe.conf.get("flexipos_billing_webhook_secret")
+    if not secret:
+        frappe.throw(_("Billing webhook secret is not configured"), frappe.PermissionError)
+    try:
+        payload = json.loads(payload_json or "{}")
+    except (TypeError, json.JSONDecodeError):
+        frappe.throw(_("Invalid billing webhook payload"))
+    if not isinstance(payload, dict):
+        frappe.throw(_("Invalid billing webhook payload"))
+    if _contains_raw_card_data(payload):
+        frappe.throw(_("Billing payload must contain tokenised payment data only"), frappe.PermissionError)
+    signed_payload = {
+        **payload,
+        "provider": provider,
+        "event_id": event_id,
+        "event_type": event_type,
+        "company": company,
+        "status": status,
+    }
+    canonical = json.dumps(signed_payload, sort_keys=True, separators=(",", ":"))
+    # Safepay signs webhooks with HMAC-SHA512; the generic adapter defaults to
+    # SHA256 so local/manual providers can use the same endpoint. Accept both
+    # hex and base64 encodings used by gateway SDKs.
+    digestmod = hashlib.sha512 if str(provider).strip().lower() == "safepay" else hashlib.sha256
+    digest = hmac.new(str(secret).encode(), canonical.encode(), digestmod)
+    expected_hex = digest.hexdigest()
+    expected_b64 = base64.b64encode(digest.digest()).decode()
+    if not signature or not (
+        hmac.compare_digest(str(signature), expected_hex)
+        or hmac.compare_digest(str(signature), expected_b64)
+    ):
+        frappe.throw(_("Invalid billing webhook signature"), frappe.PermissionError)
+    event_id = (event_id or "").strip()[:140]
+    if not event_id or not provider or not company:
+        frappe.throw(_("provider, event_id and company are required"))
+    if not frappe.db.exists("Company", company):
+        frappe.throw(_("Unknown business"), frappe.PermissionError)
+    has_event_log = bool(frappe.db.exists("DocType", "FlexiPOS Billing Event"))
+    old_event = frappe.db.get_value("Company", company, BILLING_EVENT_FIELD)
+    if (has_event_log and frappe.db.exists("FlexiPOS Billing Event", event_id)) or old_event == event_id:
+        return {"ok": True, "duplicate": True}
+    status = (status or "").strip().title()
+    if status not in SUBSCRIPTION_STATUSES:
+        frappe.throw(_("Invalid subscription status"))
+    values = {
+        BILLING_PROVIDER_FIELD: str(provider).strip().lower()[:80],
+        BILLING_EVENT_FIELD: event_id,
+        SUBSCRIPTION_STATUS_FIELD: status,
+    }
+    period_end = payload.get("current_period_end")
+    if period_end:
+        values[CURRENT_PERIOD_END_FIELD] = get_datetime(period_end)
+    if status == "Active" and (
+        not period_end or get_datetime(period_end) <= now_datetime()
+    ):
+        frappe.throw(_("An active billing event needs a future period end"))
+    token = payload.get("customer_token")
+    if token:
+        if len(str(token)) > 255:
+            frappe.throw(_("Billing payload must contain tokenised payment data only"), frappe.PermissionError)
+        values[BILLING_CUSTOMER_FIELD] = str(token)
+    if has_event_log:
+        frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Billing Event",
+                "event_id": event_id,
+                "provider": str(provider).strip().lower()[:80],
+                "company": company,
+                "event_type": str(event_type or "unknown")[:140],
+                "subscription_status": status,
+                "payload_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+                "received_at": now_datetime(),
+            }
+        ).insert(ignore_permissions=True)
+    frappe.db.set_value("Company", company, values, update_modified=False)
+    return {"ok": True, "duplicate": False, "company": company, "status": status}
+
+
+@frappe.whitelist()
+def request_data_export():
+    """Return a tenant-scoped privacy export without payment secrets."""
+    company = _get_user_company()
+    _require_admin(company)
+    users = frappe.get_all(
+        "User Permission", filters={"allow": "Company", "for_value": company}, pluck="user"
+    )
+    return {
+        "company": frappe.db.get_value("Company", company, ["name", "company_name", "country", "default_currency", "flexipos_business_type", "flexipos_phone"], as_dict=True),
+        "subscription": _subscription_payload(company),
+        "users": frappe.get_all("User", filters={"name": ("in", users)}, fields=["name", "full_name", "email", "enabled", ROLE_FIELD]),
+        "counts": {
+            "items": frappe.db.count("Item", {COMPANY_FIELD: company}),
+            "invoices": frappe.db.count("Sales Invoice", {"company": company}),
+        },
+        "generated_at": str(now_datetime()),
+        "payment_data": "Payment card data is never stored by FlexiPOS.",
+    }
+
+
+@frappe.whitelist()
+def request_data_deletion(confirm_company_name=None, confirmation=None):
+    """Schedule tenant erasure after a 30-day recovery/legal-retention window."""
+    company = _get_user_company()
+    _require_admin(company)
+    confirm_company_name = (confirm_company_name or confirmation or "").strip()
+    if confirm_company_name not in (company, f"DELETE {company}"):
+        frappe.throw(_("Type DELETE followed by the exact business name to confirm deletion"))
+    retention_until = add_to_date(now_datetime(), days=DEFAULT_RETENTION_DAYS)
+    frappe.db.set_value(
+        "Company", company,
+        {
+            SUBSCRIPTION_STATUS_FIELD: "Cancelled",
+            DELETION_REQUESTED_FIELD: now_datetime(),
+            RETENTION_UNTIL_FIELD: retention_until.date(),
+        },
+        update_modified=False,
+    )
+    return {"company": company, "status": "scheduled", "retention_until": str(retention_until.date())}
+
+
+@frappe.whitelist()
+def request_account_deletion(confirm_company_name=None, confirmation=None):
+    """Compatibility name for the account/privacy settings UI."""
+    return request_data_deletion(confirm_company_name, confirmation)
+
+
+@frappe.whitelist()
+def cancel_data_deletion():
+    company = _get_user_company()
+    _require_admin(company)
+    values = frappe.db.get_value(
+        "Company",
+        company,
+        [SUBSCRIPTION_STATUS_FIELD, TRIAL_ENDS_FIELD, CURRENT_PERIOD_END_FIELD],
+        as_dict=True,
+    ) or {}
+    if values.get(SUBSCRIPTION_STATUS_FIELD) == "Archived":
+        frappe.throw(_("Archived business data cannot be restored"), frappe.PermissionError)
+    now = now_datetime()
+    if values.get(CURRENT_PERIOD_END_FIELD) and get_datetime(values[CURRENT_PERIOD_END_FIELD]) > now:
+        restored_status = "Active"
+    elif values.get(TRIAL_ENDS_FIELD) and get_datetime(values[TRIAL_ENDS_FIELD]) > now:
+        restored_status = "Trialing"
+    else:
+        restored_status = "Past Due"
+    frappe.db.set_value(
+        "Company",
+        company,
+        {
+            DELETION_REQUESTED_FIELD: None,
+            RETENTION_UNTIL_FIELD: None,
+            SUBSCRIPTION_STATUS_FIELD: restored_status,
+        },
+        update_modified=False,
+    )
+    return {"company": company, "subscription": _subscription_payload(company)}
 
 
 def _get_business_config(company):
@@ -720,6 +1327,7 @@ def _setup_business(company_name, business_type, phone):
     customer = _ensure_walk_in_customer()
     pos_profile = _create_pos_profile(company, customer)
     _link_current_user(company)
+    subscription = _subscription_payload(company.name)
     return {
         "company": company.name,
         "company_abbr": company.abbr,
@@ -730,6 +1338,8 @@ def _setup_business(company_name, business_type, phone):
         "currency": company.default_currency,
         "warehouse": pos_profile.warehouse,
         "price_list": pos_profile.selling_price_list,
+        "subscription": subscription,
+        **_subscription_client_payload(company.name),
     }
 
 
@@ -797,6 +1407,9 @@ def _create_company(company_name, business_type, phone):
             CATEGORY_NAMES_FIELD: "[]",
             DEFAULT_TAX_RATE_FIELD: 0,
             SERVICE_STYLES_FIELD: "Dine-in,Takeaway" if business_type == "Restaurant" else "",
+            SUBSCRIPTION_STATUS_FIELD: "Trialing",
+            TRIAL_ENDS_FIELD: add_to_date(now_datetime(), days=_default_trial_days()),
+            BILLING_EMAIL_FIELD: frappe.session.user if "@" in (frappe.session.user or "") else "",
             "enable_perpetual_inventory": 0,
         }
     )
@@ -3278,6 +3891,12 @@ def _require_any_screen_access(*permissions):
     user = frappe.session.user
     if not user or user == "Guest":
         frappe.throw(_("Login required"), frappe.AuthenticationError)
+
+    # Administrator is the site operator and must retain access to repair a
+    # tenant's billing state. Tenant users are gated by their subscription
+    # before screen capabilities are evaluated.
+    if user != "Administrator":
+        _require_subscription_access()
 
     requested = {
         value for value in permissions if value in ALL_SCREEN_PERMISSIONS

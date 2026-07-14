@@ -107,3 +107,99 @@ checks `/api/method/ping` over HTTPS. Application files roll back automatically
 on an error. Database migrations are not automatically reversible; if a failed
 migration changed data incompatibly, use the verified pre-deployment backup and
 the restore procedure above.
+# SaaS billing, tenant lifecycle and privacy
+
+Every newly created business starts with a seven-day `Trialing` subscription.
+No card number, CVV, or PAN is accepted or persisted by FlexiPOS. The app
+stores only an opaque payment-provider customer token and provider name.
+
+The billing API is provider-neutral. In Pakistan, Safepay is a practical first
+choice when its merchant account is approved because it supports PKR recurring
+plans and hosted Checkout; configure a PSP such as PayFast if its merchant
+account supports the plan/recurring flow you need;
+manual bank settlement, Easypaisa/JazzCash, or another local gateway can use
+the same signed webhook. Do not treat a gateway as the source of truth until
+its webhook is verified.
+
+Set the webhook secret per site (never commit it):
+
+```sh
+bench --site <site> set-config flexipos_billing_webhook_secret '<random-secret>'
+```
+
+Safepay is the preferred first provider for Pakistan because its hosted
+Checkout supports PKR recurring plans, trial periods, and vaulted payment
+instruments. Keep PayFast/Raast/wallets as optional invoice or manual-renewal
+rails unless your merchant agreement explicitly enables recurring tokenized
+charges. Set the provider and enable mandatory payment-method setup only after
+the Safepay sandbox checkout and webhook adapter are live:
+
+```sh
+bench --site <site> set-config flexipos_billing_provider safepay
+bench --site <site> set-config flexipos_require_card_on_signup 1 --parse
+bench --site <site> migrate
+```
+
+When the card-on-signup flag is enabled, new and existing tenants without a
+provider token are routed to hosted billing before operational screens. The
+provider captures the card and returns an opaque instrument/customer token;
+FlexiPOS never receives PAN or CVV. Leave the flag disabled until production
+merchant credentials and the hosted checkout URL are configured.
+
+The client flow is:
+
+1. Call `get_subscription_status` after login. During trial, show the exact
+   trial end timestamp and a billing CTA.
+2. Collect billing details in the provider-hosted checkout (never in Flutter)
+   and call `create_billing_checkout` with `provider`, `plan`, optional opaque
+   `customer_token`, and `privacy_consent=true`.
+3. The gateway sends `billing_webhook` with `event_id`, `status`, and a
+   canonical `payload_json` signed using HMAC-SHA512 for Safepay (HMAC-SHA256
+   for generic adapters). Duplicate event IDs are idempotent. An `Active`
+   event must include a future `current_period_end`.
+4. The daily scheduler moves expired trials/periods to `Past Due`. All tenant
+   business endpoints enforce lifecycle status server-side; `Administrator`
+   remains available to repair billing.
+
+Supported account states are `Trialing`, `Active`, `Past Due`, `Suspended`,
+`Cancelled`, and `Archived`. Operators can use `admin_set_subscription` for
+verified manual settlements and `cancel_subscription` when a plan is ended.
+
+Privacy controls are tenant-admin-only. `request_data_export` returns company,
+user, and record-count data but excludes payment tokens. `request_account_deletion`
+requires the exact company name and schedules a 30-day recovery/legal-retention
+window. `cancel_data_deletion` restores an account during that window. The
+daily lifecycle job then disables and anonymises tenant users, clears billing
+identifiers, and marks the tenant `Archived`; financial documents are retained
+for the site's legal retention policy and are not silently destroyed.
+
+## SaaS operator controls
+
+Only the Frappe `Administrator` can call these cross-tenant methods. Each
+change writes an Activity Log entry without payment credentials:
+
+- `saas_list_tenants` lists subscription, trial, provider and deletion state.
+- `saas_set_default_trial_days(days)` changes the trial for future companies
+  from 0 to 90 days. The initial default is 7 days.
+- `saas_extend_trial(company=..., days=...)` adds time to one company.
+- `saas_extend_trial(all_companies=1, days=...)` adds time to all eligible
+  companies, excluding archived or deletion-pending tenants.
+- `saas_set_tenant_status(company, status, current_period_end, reason)`
+  suspends, reactivates, cancels or archives a company.
+
+Example bench calls:
+
+```sh
+bench --site <site> execute flexipos.api.saas_extend_trial \
+  --kwargs '{"company":"Example Company","days":14}'
+bench --site <site> execute flexipos.api.saas_extend_trial \
+  --kwargs '{"all_companies":1,"days":3}'
+bench --site <site> execute flexipos.api.saas_set_default_trial_days \
+  --kwargs '{"days":7}'
+bench --site <site> execute flexipos.api.saas_set_tenant_status \
+  --kwargs '{"company":"Example Company","status":"Suspended","reason":"Chargeback review"}'
+```
+
+Billing webhook receipts are recorded in `FlexiPOS Billing Event` with a
+unique provider event ID and payload hash, so older replayed events cannot be
+accepted merely because a newer event arrived in between.
