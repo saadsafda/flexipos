@@ -201,6 +201,7 @@ DEFAULT_RETENTION_DAYS = 30
 OPERATIONAL_SUBSCRIPTION_STATUSES = {"Trialing", "Active"}
 DEFAULT_TRIAL_DAYS_KEY = "flexipos_default_trial_days"
 MAX_TRIAL_EXTENSION_DAYS = 365
+SAAS_SETTINGS_DOCTYPE = "FlexiPOS SaaS Settings"
 
 
 # ---------------------------------------------------------------------------
@@ -758,7 +759,8 @@ def _subscription_payload(company):
     now = now_datetime()
     trial_end = values.get(TRIAL_ENDS_FIELD)
     period_end = values.get(CURRENT_PERIOD_END_FIELD)
-    require_billing_setup = cint(frappe.conf.get("flexipos_require_card_on_signup"))
+    saas_settings = _get_saas_settings()
+    require_billing_setup = cint(saas_settings.require_payment_method_on_signup)
     has_payment_token = bool(frappe.db.get_value("Company", company, BILLING_CUSTOMER_FIELD))
     if status == "Trialing" and trial_end and get_datetime(trial_end) <= now:
         status = "Past Due"
@@ -770,21 +772,74 @@ def _subscription_payload(company):
         "status": status,
         "trial_ends_on": str(trial_end) if trial_end else None,
         "current_period_end": str(period_end) if period_end else None,
-        "billing_provider": values.get(BILLING_PROVIDER_FIELD) or None,
+        "billing_provider": values.get(BILLING_PROVIDER_FIELD)
+        or (saas_settings.billing_provider if saas_settings.billing_enabled else None),
         "plan": values.get(BILLING_PLAN_FIELD) or None,
         "billing_email": values.get(BILLING_EMAIL_FIELD) or None,
         "deletion_requested_at": str(values.get(DELETION_REQUESTED_FIELD)) if values.get(DELETION_REQUESTED_FIELD) else None,
         "retention_until": str(values.get(RETENTION_UNTIL_FIELD)) if values.get(RETENTION_UNTIL_FIELD) else None,
         "trial_days": _default_trial_days(),
         "billing_setup_required": bool(require_billing_setup and not has_payment_token),
+        "terms_url": saas_settings.terms_url or None,
+        "privacy_url": saas_settings.privacy_url or None,
     }
 
 
 def _default_trial_days():
     """Site-wide trial length for future tenants, bounded defensively."""
-    configured = frappe.db.get_default(DEFAULT_TRIAL_DAYS_KEY)
+    settings = _get_saas_settings()
+    configured = settings.default_trial_days
+    if configured in (None, ""):
+        configured = frappe.db.get_default(DEFAULT_TRIAL_DAYS_KEY)
     days = DEFAULT_TRIAL_DAYS if configured in (None, "") else cint(configured)
     return max(0, min(days, 90))
+
+
+def _get_saas_settings(include_secrets=False):
+    """Return the site-wide billing configuration with safe legacy fallbacks.
+
+    Tenant-facing callers never request secrets. Password values are decrypted
+    only for server-side provider/webhook operations.
+    """
+    values = frappe._dict(
+        billing_enabled=bool(frappe.conf.get("flexipos_billing_enabled")),
+        billing_provider=frappe.conf.get("flexipos_billing_provider") or "Safepay",
+        sandbox_mode=bool(frappe.conf.get("flexipos_billing_sandbox", True)),
+        require_payment_method_on_signup=bool(
+            frappe.conf.get("flexipos_require_card_on_signup")
+        ),
+        public_api_key=frappe.conf.get("flexipos_billing_public_key"),
+        checkout_url=frappe.conf.get("flexipos_billing_checkout_url"),
+        default_plan="monthly",
+        monthly_plan_id=None,
+        annual_plan_id=None,
+        default_trial_days=frappe.db.get_default(DEFAULT_TRIAL_DAYS_KEY),
+        deletion_retention_days=DEFAULT_RETENTION_DAYS,
+        terms_url=None,
+        privacy_url=None,
+    )
+    if frappe.db.exists("DocType", SAAS_SETTINGS_DOCTYPE):
+        doc = frappe.get_single(SAAS_SETTINGS_DOCTYPE)
+        for fieldname in values:
+            value = doc.get(fieldname)
+            if value not in (None, ""):
+                values[fieldname] = value
+        if include_secrets:
+            values.secret_api_key = doc.get_password(
+                "secret_api_key", raise_exception=False
+            ) or frappe.conf.get("flexipos_billing_secret_key")
+            values.webhook_secret = doc.get_password(
+                "webhook_secret", raise_exception=False
+            ) or frappe.conf.get("flexipos_billing_webhook_secret")
+    elif include_secrets:
+        values.secret_api_key = frappe.conf.get("flexipos_billing_secret_key")
+        values.webhook_secret = frappe.conf.get("flexipos_billing_webhook_secret")
+    return values
+
+
+def _default_deletion_retention_days():
+    configured = cint(_get_saas_settings().deletion_retention_days)
+    return max(1, min(configured or DEFAULT_RETENTION_DAYS, 3650))
 
 
 def _subscription_client_payload(company):
@@ -904,7 +959,12 @@ def saas_set_default_trial_days(days):
     days = cint(days)
     if days < 0 or days > 90:
         frappe.throw(_("Default trial days must be between 0 and 90"))
-    frappe.db.set_default(DEFAULT_TRIAL_DAYS_KEY, days)
+    if frappe.db.exists("DocType", SAAS_SETTINGS_DOCTYPE):
+        settings = frappe.get_single(SAAS_SETTINGS_DOCTYPE)
+        settings.default_trial_days = days
+        settings.save(ignore_permissions=True)
+    else:
+        frappe.db.set_default(DEFAULT_TRIAL_DAYS_KEY, days)
     _audit_saas_action("default trial changed", details={"days": days})
     return {"default_trial_days": days}
 
@@ -994,8 +1054,14 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
     """
     company = _get_user_company()
     _require_admin(company)
-    provider = (provider or frappe.conf.get("flexipos_billing_provider") or "safepay").strip().lower()
-    plan = (plan or "").strip()[:80]
+    settings = _get_saas_settings()
+    if not cint(settings.billing_enabled):
+        frappe.throw(_("Billing is not enabled by the SaaS operator"))
+    configured_provider = (settings.billing_provider or "safepay").strip().lower()
+    provider = (provider or configured_provider).strip().lower()
+    if provider != configured_provider:
+        frappe.throw(_("The requested billing provider is not enabled"), frappe.PermissionError)
+    plan = (plan or settings.default_plan or "").strip()[:80]
     billing_email = (billing_email or frappe.session.user or "").strip().lower()
     if not provider or not plan:
         frappe.throw(_("Billing provider and plan are required"))
@@ -1026,6 +1092,7 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
         "plan": plan,
         "status": _subscription_payload(company)["status"],
         "checkout_required": True,
+        "checkout_url": settings.checkout_url or None,
         "card_data_storage": "never",
     }
 
@@ -1077,15 +1144,21 @@ def _contains_raw_card_data(value):
     return False
 
 
-@frappe.whitelist()
+@frappe.whitelist(allow_guest=True)
 def billing_webhook(provider, event_id, event_type, company, status, signature, payload_json="{}"):
     """Consume an idempotent, HMAC-signed gateway event.
 
-    Configure ``flexipos_billing_webhook_secret`` in site_config.json. The
+    Configure the encrypted webhook secret in FlexiPOS SaaS Settings. The
     canonical JSON payload is signed with HMAC-SHA256. Webhook handlers only
     store opaque customer tokens; raw card data is rejected by design.
     """
-    secret = frappe.conf.get("flexipos_billing_webhook_secret")
+    settings = _get_saas_settings(include_secrets=True)
+    if not cint(settings.billing_enabled):
+        frappe.throw(_("Billing is not enabled"), frappe.PermissionError)
+    configured_provider = (settings.billing_provider or "").strip().lower()
+    if str(provider or "").strip().lower() != configured_provider:
+        frappe.throw(_("Webhook provider does not match SaaS settings"), frappe.PermissionError)
+    secret = settings.webhook_secret
     if not secret:
         frappe.throw(_("Billing webhook secret is not configured"), frappe.PermissionError)
     try:
@@ -1192,7 +1265,9 @@ def request_data_deletion(confirm_company_name=None, confirmation=None):
     confirm_company_name = (confirm_company_name or confirmation or "").strip()
     if confirm_company_name not in (company, f"DELETE {company}"):
         frappe.throw(_("Type DELETE followed by the exact business name to confirm deletion"))
-    retention_until = add_to_date(now_datetime(), days=DEFAULT_RETENTION_DAYS)
+    retention_until = add_to_date(
+        now_datetime(), days=_default_deletion_retention_days()
+    )
     frappe.db.set_value(
         "Company", company,
         {

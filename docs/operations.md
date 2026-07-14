@@ -121,26 +121,31 @@ manual bank settlement, Easypaisa/JazzCash, or another local gateway can use
 the same signed webhook. Do not treat a gateway as the source of truth until
 its webhook is verified.
 
-Set the webhook secret per site (never commit it):
+All site-wide billing configuration is managed in the singleton
+**FlexiPOS SaaS Settings** DocType. Only users with the System Manager role can
+read or update it. Provider secret keys and the webhook secret use Frappe
+`Password` fields and are encrypted at rest; they are never returned to tenant
+or Flutter APIs.
 
-```sh
-bench --site <site> set-config flexipos_billing_webhook_secret '<random-secret>'
-```
+Configure the provider, sandbox mode, public API key, secret API key, webhook
+secret, hosted checkout URL, provider plan IDs, trial length, card/payment
+method requirement, deletion retention, and legal links in that one document.
+Open it from the Frappe Desk search by entering `FlexiPOS SaaS Settings`.
+Do not grant System Manager to tenant staff merely so they can manage their
+own subscription; this document controls every company on the site.
 
 Safepay is the preferred first provider for Pakistan because its hosted
 Checkout supports PKR recurring plans, trial periods, and vaulted payment
 instruments. Keep PayFast/Raast/wallets as optional invoice or manual-renewal
 rails unless your merchant agreement explicitly enables recurring tokenized
-charges. Set the provider and enable mandatory payment-method setup only after
-the Safepay sandbox checkout and webhook adapter are live:
+charges. Enable **Require Card / Payment Method on Signup** only after the
+Safepay sandbox checkout and webhook adapter are live:
 
 ```sh
-bench --site <site> set-config flexipos_billing_provider safepay
-bench --site <site> set-config flexipos_require_card_on_signup 1 --parse
 bench --site <site> migrate
 ```
 
-When the card-on-signup flag is enabled, new and existing tenants without a
+When the signup payment-method setting is enabled, new and existing tenants without a
 provider token are routed to hosted billing before operational screens. The
 provider captures the card and returns an opaque instrument/customer token;
 FlexiPOS never receives PAN or CVV. Leave the flag disabled until production
