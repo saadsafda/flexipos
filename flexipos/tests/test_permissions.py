@@ -227,6 +227,7 @@ class TestSubscriptionLifecycle(FrappeTestCase):
         self.assertEqual(
             request.get_header("X-sfpy-merchant-secret"), "merchant-secret"
         )
+        self.assertEqual(request.get_header("User-agent"), "FlexiPOS-SaaS/1.0")
 
     def test_safepay_auth_rejection_explains_environment_mismatch(self):
         settings = frappe._dict(
@@ -244,6 +245,31 @@ class TestSubscriptionLifecycle(FrappeTestCase):
             patch.object(api.urllib.request, "urlopen", side_effect=error),
             patch.object(frappe, "log_error"),
             self.assertRaisesRegex(Exception, "Secret API Key.*sandbox"),
+        ):
+            api._create_safepay_subscription_url(
+                settings,
+                "plan_123",
+                "sprout_ref",
+                "https://example.com/success",
+                "https://example.com/cancel",
+            )
+
+    def test_safepay_forbidden_response_is_not_reported_as_bad_key(self):
+        settings = frappe._dict(
+            sandbox_mode=1,
+            secret_api_key="valid-secret",
+        )
+        error = urllib.error.HTTPError(
+            "https://sandbox.api.getsafepay.com/client/passport/v1/token",
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b"forbidden"),
+        )
+        with (
+            patch.object(api.urllib.request, "urlopen", side_effect=error),
+            patch.object(frappe, "log_error"),
+            self.assertRaisesRegex(Exception, "refused checkout requests.*403"),
         ):
             api._create_safepay_subscription_url(
                 settings,

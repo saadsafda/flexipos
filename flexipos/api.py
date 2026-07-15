@@ -1184,6 +1184,7 @@ def _create_safepay_subscription_url(settings, plan_id, reference, redirect_url,
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
+            "User-Agent": "FlexiPOS-SaaS/1.0",
             "X-SFPY-MERCHANT-SECRET": merchant_secret,
         },
     )
@@ -1202,13 +1203,21 @@ def _create_safepay_subscription_url(settings, plan_id, reference, redirect_url,
             f"{provider_body[:1000]}",
             "Safepay checkout creation failed",
         )
-        if exc.code in (401, 403):
+        if exc.code == 401:
             environment = _("sandbox") if sandbox else _("production")
             frappe.throw(
                 _(
                     "Safepay rejected the Secret API Key for the {0} environment. "
                     "Use a {0} Secret Key or change Sandbox Mode in FlexiPOS SaaS Settings."
                 ).format(environment)
+            )
+        if exc.code == 403:
+            frappe.throw(
+                _(
+                    "Safepay refused checkout requests from this server (HTTP 403). "
+                    "Check the Safepay response in Error Log and ask Safepay to allow "
+                    "the server's public IP if required."
+                )
             )
         frappe.throw(
             _("Safepay could not start checkout (HTTP {0}). Please try again.").format(
