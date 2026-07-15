@@ -1,5 +1,7 @@
 import ast
+import io
 import json
+import urllib.error
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import MagicMock, patch
@@ -202,6 +204,54 @@ class TestSubscriptionLifecycle(FrappeTestCase):
         self.assertIn("auth_token=short-lived-token", url)
         self.assertIn("reference=sprout_ref", url)
         self.assertNotIn("merchant-secret", url)
+
+    def test_safepay_secret_is_trimmed_before_authentication(self):
+        response = MagicMock()
+        response.read.return_value = b'{"data":"short-lived-token"}'
+        response.__enter__.return_value = response
+        settings = frappe._dict(
+            sandbox_mode=1,
+            secret_api_key="  merchant-secret\n",
+        )
+        with patch.object(
+            api.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
+            api._create_safepay_subscription_url(
+                settings,
+                "plan_123",
+                "sprout_ref",
+                "https://example.com/success",
+                "https://example.com/cancel",
+            )
+        request = urlopen.call_args.args[0]
+        self.assertEqual(
+            request.get_header("X-sfpy-merchant-secret"), "merchant-secret"
+        )
+
+    def test_safepay_auth_rejection_explains_environment_mismatch(self):
+        settings = frappe._dict(
+            sandbox_mode=1,
+            secret_api_key="invalid-secret",
+        )
+        error = urllib.error.HTTPError(
+            "https://sandbox.api.getsafepay.com/client/passport/v1/token",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"status":{"message":"fail"}}'),
+        )
+        with (
+            patch.object(api.urllib.request, "urlopen", side_effect=error),
+            patch.object(frappe, "log_error"),
+            self.assertRaisesRegex(Exception, "Secret API Key.*sandbox"),
+        ):
+            api._create_safepay_subscription_url(
+                settings,
+                "plan_123",
+                "sprout_ref",
+                "https://example.com/success",
+                "https://example.com/cancel",
+            )
 
 
 class TestTenantOwnership(FrappeTestCase):

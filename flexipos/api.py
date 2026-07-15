@@ -1168,6 +1168,10 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
 def _create_safepay_subscription_url(settings, plan_id, reference, redirect_url, cancel_url):
     """Create Safepay's short-lived subscription URL without exposing secrets."""
     sandbox = cint(settings.sandbox_mode)
+    # Password fields preserve pasted whitespace. Safepay compares this value
+    # exactly, so a trailing newline copied from a password manager otherwise
+    # produces an opaque 401 response.
+    merchant_secret = str(settings.secret_api_key or "").strip()
     api_host = (
         "https://sandbox.api.getsafepay.com"
         if sandbox
@@ -1180,15 +1184,50 @@ def _create_safepay_subscription_url(settings, plan_id, reference, redirect_url,
         headers={
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-SFPY-MERCHANT-SECRET": str(settings.secret_api_key),
+            "X-SFPY-MERCHANT-SECRET": merchant_secret,
         },
     )
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
             body = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError):
+    except urllib.error.HTTPError as exc:
+        # HTTPError is also a URLError; handle it first so an invalid key is
+        # not reported to the customer as a vague connectivity problem.
+        try:
+            provider_body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            provider_body = ""
+        frappe.log_error(
+            f"Safepay token endpoint returned HTTP {exc.code}: "
+            f"{provider_body[:1000]}",
+            "Safepay checkout creation failed",
+        )
+        if exc.code in (401, 403):
+            environment = _("sandbox") if sandbox else _("production")
+            frappe.throw(
+                _(
+                    "Safepay rejected the Secret API Key for the {0} environment. "
+                    "Use a {0} Secret Key or change Sandbox Mode in FlexiPOS SaaS Settings."
+                ).format(environment)
+            )
+        frappe.throw(
+            _("Safepay could not start checkout (HTTP {0}). Please try again.").format(
+                exc.code
+            )
+        )
+    except (urllib.error.URLError, TimeoutError) as exc:
+        frappe.log_error(
+            f"Safepay token endpoint could not be reached: {exc}",
+            "Safepay checkout creation failed",
+        )
+        frappe.throw(
+            _("Safepay could not be reached. Check the server network and try again.")
+        )
+    except (ValueError, UnicodeDecodeError):
         frappe.log_error(frappe.get_traceback(), "Safepay checkout creation failed")
-        frappe.throw(_("Safepay could not start secure checkout. Please try again."))
+        frappe.throw(
+            _("Safepay returned an unreadable checkout response. Please try again.")
+        )
     auth_token = body.get("data") if isinstance(body, dict) else None
     if isinstance(auth_token, dict):
         auth_token = auth_token.get("token") or auth_token.get("auth_token")
