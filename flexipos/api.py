@@ -54,6 +54,9 @@ import hmac
 import json
 import math
 import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import frappe
 from frappe import _
@@ -202,6 +205,7 @@ OPERATIONAL_SUBSCRIPTION_STATUSES = {"Trialing", "Active"}
 DEFAULT_TRIAL_DAYS_KEY = "flexipos_default_trial_days"
 MAX_TRIAL_EXTENSION_DAYS = 365
 SAAS_SETTINGS_DOCTYPE = "FlexiPOS SaaS Settings"
+BILLING_CHECKOUT_DOCTYPE = "FlexiPOS Billing Checkout"
 
 
 # ---------------------------------------------------------------------------
@@ -1045,7 +1049,7 @@ def saas_set_tenant_status(company, status, current_period_end=None, reason=None
 
 @frappe.whitelist()
 def start_billing_checkout(plan, provider=None, billing_email=None, customer_token=None, privacy_consent=False):
-    """Save a provider-neutral billing intent.
+    """Create a provider-hosted subscription checkout.
 
     The app must never receive card numbers/CVV. ``customer_token`` is an
     opaque gateway token is accepted only from the gateway's signed webhook.
@@ -1054,14 +1058,19 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
     """
     company = _get_user_company()
     _require_admin(company)
-    settings = _get_saas_settings()
+    if customer_token:
+        frappe.throw(
+            _("Payment tokens can only be registered by a verified billing webhook"),
+            frappe.PermissionError,
+        )
+    settings = _get_saas_settings(include_secrets=True)
     if not cint(settings.billing_enabled):
         frappe.throw(_("Billing is not enabled by the SaaS operator"))
     configured_provider = (settings.billing_provider or "safepay").strip().lower()
     provider = (provider or configured_provider).strip().lower()
     if provider != configured_provider:
         frappe.throw(_("The requested billing provider is not enabled"), frappe.PermissionError)
-    plan = (plan or settings.default_plan or "").strip()[:80]
+    plan = (plan or settings.default_plan or "").strip().lower()[:80]
     billing_email = (billing_email or frappe.session.user or "").strip().lower()
     if not provider or not plan:
         frappe.throw(_("Billing provider and plan are required"))
@@ -1069,11 +1078,6 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
         validate_email_address(billing_email, throw=True)
     if not cint(privacy_consent):
         frappe.throw(_("Privacy consent is required before billing"))
-    if customer_token:
-        frappe.throw(
-            _("Payment tokens can only be registered by a verified billing webhook"),
-            frappe.PermissionError,
-        )
     frappe.db.set_value(
         "Company", company,
         {
@@ -1086,14 +1090,144 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
         },
         update_modified=False,
     )
+    if provider != "safepay":
+        if provider == "custom" and settings.checkout_url:
+            return {
+                "company": company,
+                "provider": provider,
+                "plan": plan,
+                "status": _subscription_payload(company)["status"],
+                "checkout_required": True,
+                "checkout_url": settings.checkout_url,
+                "card_data_storage": "never",
+            }
+        frappe.throw(
+            _("Automatic in-app subscription checkout is currently available for Safepay only")
+        )
+
+    plan_ids = {
+        "monthly": settings.monthly_plan_id,
+        "annual": settings.annual_plan_id,
+    }
+    if plan not in plan_ids:
+        frappe.throw(_("Choose either the monthly or annual plan"))
+    plan_id = (plan_ids[plan] or "").strip()
+    if not plan_id:
+        frappe.throw(
+            _("The {0} Safepay plan ID is not configured").format(plan.title())
+        )
+    if not settings.secret_api_key:
+        frappe.throw(_("The Safepay secret API key is not configured"))
+    if not frappe.db.exists("DocType", BILLING_CHECKOUT_DOCTYPE):
+        frappe.throw(_("Billing checkout is not installed. Run bench migrate."))
+
+    reference = f"sprout_{secrets.token_urlsafe(24)}"[:80]
+    callback_base = (
+        f"{frappe.utils.get_url()}/api/method/"
+        "flexipos.api.billing_checkout_return"
+    )
+    redirect_url = f"{callback_base}?{urllib.parse.urlencode({'status': 'success', 'reference': reference})}"
+    cancel_url = f"{callback_base}?{urllib.parse.urlencode({'status': 'cancelled', 'reference': reference})}"
+    checkout_url = _create_safepay_subscription_url(
+        settings=settings,
+        plan_id=plan_id,
+        reference=reference,
+        redirect_url=redirect_url,
+        cancel_url=cancel_url,
+    )
+    frappe.get_doc(
+        {
+            "doctype": BILLING_CHECKOUT_DOCTYPE,
+            "reference": reference,
+            "company": company,
+            "provider": provider,
+            "plan": plan,
+            "provider_plan_id": plan_id,
+            "billing_email": billing_email,
+            "status": "Pending",
+            "expires_at": add_to_date(now_datetime(), hours=1),
+        }
+    ).insert(ignore_permissions=True)
     return {
         "company": company,
         "provider": provider,
         "plan": plan,
         "status": _subscription_payload(company)["status"],
         "checkout_required": True,
-        "checkout_url": settings.checkout_url or None,
+        "checkout_url": checkout_url,
+        "reference": reference,
+        "return_url": redirect_url,
+        "cancel_url": cancel_url,
+        "webhook_url": (
+            f"{frappe.utils.get_url()}/api/method/flexipos.api.safepay_webhook"
+        ),
         "card_data_storage": "never",
+    }
+
+
+def _create_safepay_subscription_url(settings, plan_id, reference, redirect_url, cancel_url):
+    """Create Safepay's short-lived subscription URL without exposing secrets."""
+    sandbox = cint(settings.sandbox_mode)
+    api_host = (
+        "https://sandbox.api.getsafepay.com"
+        if sandbox
+        else "https://api.getsafepay.com"
+    )
+    request = urllib.request.Request(
+        f"{api_host}/client/passport/v1/token",
+        data=b"{}",
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "X-SFPY-MERCHANT-SECRET": str(settings.secret_api_key),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        frappe.log_error(frappe.get_traceback(), "Safepay checkout creation failed")
+        frappe.throw(_("Safepay could not start secure checkout. Please try again."))
+    auth_token = body.get("data") if isinstance(body, dict) else None
+    if isinstance(auth_token, dict):
+        auth_token = auth_token.get("token") or auth_token.get("auth_token")
+    if not auth_token or not isinstance(auth_token, str):
+        frappe.log_error(str(body)[:1000], "Unexpected Safepay token response")
+        frappe.throw(_("Safepay returned an invalid checkout token"))
+    checkout_host = (
+        "https://sandbox.api.getsafepay.com/checkout/subscribe"
+        if sandbox
+        else "https://getsafepay.com/checkout/subscribe"
+    )
+    query = urllib.parse.urlencode(
+        {
+            "plan_id": plan_id,
+            "auth_token": auth_token,
+            "env": "sandbox" if sandbox else "production",
+            "cancel_url": cancel_url,
+            "redirect_url": redirect_url,
+            "reference": reference,
+        }
+    )
+    return f"{checkout_host}?{query}"
+
+
+@frappe.whitelist(allow_guest=True)
+def billing_checkout_return(status=None, reference=None):
+    """A harmless hosted-checkout landing point intercepted by the app.
+
+    This endpoint deliberately does not activate anything. Only a verified
+    provider webhook can change subscription access.
+    """
+    normalized = str(status or "pending").strip().lower()
+    if normalized not in {"success", "cancelled", "pending"}:
+        normalized = "pending"
+    return {
+        "ok": True,
+        "status": normalized,
+        "reference": str(reference or "")[:80],
+        "message": _("You can return to Sprout while payment is verified."),
     }
 
 
@@ -1234,6 +1368,207 @@ def billing_webhook(provider, event_id, event_type, company, status, signature, 
         ).insert(ignore_permissions=True)
     frappe.db.set_value("Company", company, values, update_modified=False)
     return {"ok": True, "duplicate": False, "company": company, "status": status}
+
+
+def _find_billing_value(value, keys):
+    """Find a provider field in a nested webhook without trusting its tenant."""
+    wanted = {str(key).lower() for key in keys}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).lower() in wanted and child not in (None, ""):
+                return child
+        for child in value.values():
+            found = _find_billing_value(child, wanted)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_billing_value(child, wanted)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _safepay_event_status(event_type, data):
+    """Translate only explicit Safepay outcomes into tenant lifecycle states."""
+    event = str(event_type or "").strip().lower().replace("-", "_")
+    provider_status = str(
+        _find_billing_value(data, {"subscription_status", "payment_status", "status"})
+        or ""
+    ).strip().lower().replace("-", "_")
+    text = f"{event} {provider_status}"
+    if any(word in text for word in ("cancelled", "canceled", "terminated")):
+        return "Cancelled"
+    if any(word in text for word in ("past_due", "payment_failed", "failed", "unpaid")):
+        return "Past Due"
+    explicit_success = provider_status in {
+        "active", "activated", "paid", "succeeded", "successful", "completed"
+    }
+    success_event = any(
+        word in event
+        for word in (
+            "subscription.activated", "subscription_activated",
+            "payment.succeeded", "payment_succeeded",
+            "subscription.payment_succeeded", "subscription_payment_succeeded",
+        )
+    )
+    if explicit_success or success_event:
+        return "Active"
+    return None
+
+
+@frappe.whitelist(allow_guest=True)
+def safepay_webhook():
+    """Verify and apply a native Safepay subscription webhook.
+
+    Safepay signs ``JSON.stringify(body.data)`` with HMAC-SHA512 in the
+    ``X-SFPY-SIGNATURE`` header. The checkout reference—not a company sent by
+    the provider—is resolved against our server-created checkout record.
+    """
+    settings = _get_saas_settings(include_secrets=True)
+    if not cint(settings.billing_enabled) or (
+        settings.billing_provider or ""
+    ).strip().lower() != "safepay":
+        frappe.throw(_("Safepay billing is not enabled"), frappe.PermissionError)
+    secret = settings.webhook_secret
+    if not secret:
+        frappe.throw(_("Billing webhook secret is not configured"), frappe.PermissionError)
+    body = frappe.request.get_json(silent=True) or {}
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, (dict, list)) or _contains_raw_card_data(data):
+        frappe.throw(_("Invalid Safepay webhook payload"), frappe.PermissionError)
+    canonical = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    expected = hmac.new(
+        str(secret).encode("utf-8"), canonical.encode("utf-8"), hashlib.sha512
+    ).hexdigest()
+    supplied = str(frappe.request.headers.get("X-SFPY-SIGNATURE") or "").strip()
+    if not supplied or not hmac.compare_digest(supplied.lower(), expected.lower()):
+        frappe.throw(_("Invalid Safepay webhook signature"), frappe.PermissionError)
+
+    reference = str(
+        _find_billing_value(data, {"reference", "client_reference", "merchant_reference"})
+        or ""
+    ).strip()[:80]
+    subscription_id = str(
+        _find_billing_value(data, {"subscription_id", "subscription_token"})
+        or ""
+    ).strip()[:255]
+    checkout_by_reference = (
+        reference
+        if reference and frappe.db.exists(BILLING_CHECKOUT_DOCTYPE, reference)
+        else None
+    )
+    checkout_by_subscription = (
+        frappe.db.get_value(
+            BILLING_CHECKOUT_DOCTYPE,
+            {"provider_subscription_id": subscription_id},
+            "name",
+        )
+        if subscription_id
+        else None
+    )
+    if (
+        checkout_by_reference
+        and checkout_by_subscription
+        and checkout_by_reference != checkout_by_subscription
+    ):
+        frappe.throw(_("Safepay subscription reference mismatch"), frappe.PermissionError)
+    checkout_name = checkout_by_reference or checkout_by_subscription
+    if not checkout_name:
+        frappe.throw(_("Unknown Safepay checkout reference"), frappe.PermissionError)
+    checkout = frappe.db.get_value(
+        BILLING_CHECKOUT_DOCTYPE,
+        checkout_name,
+        ["company", "plan", "status", "expires_at"],
+        as_dict=True,
+    )
+    company = checkout.company
+    if not company or not frappe.db.exists("Company", company):
+        frappe.throw(_("Unknown business"), frappe.PermissionError)
+
+    event_type = str(
+        body.get("type")
+        or body.get("event")
+        or _find_billing_value(data, {"event_type", "type"})
+        or "unknown"
+    )[:140]
+    event_id = str(
+        body.get("id")
+        or body.get("event_id")
+        or hashlib.sha256(
+            f"{event_type}:{checkout_name}:{canonical}".encode("utf-8")
+        ).hexdigest()
+    )[:140]
+    if frappe.db.exists("FlexiPOS Billing Event", event_id):
+        return {"ok": True, "duplicate": True}
+
+    status = _safepay_event_status(event_type, data)
+    payload_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    frappe.get_doc(
+        {
+            "doctype": "FlexiPOS Billing Event",
+            "event_id": event_id,
+            "provider": "safepay",
+            "company": company,
+            "event_type": event_type,
+            "subscription_status": status or "Ignored",
+            "payload_hash": payload_hash,
+            "received_at": now_datetime(),
+        }
+    ).insert(ignore_permissions=True)
+    if not status:
+        return {"ok": True, "duplicate": False, "ignored": True}
+
+    values = {
+        BILLING_PROVIDER_FIELD: "safepay",
+        BILLING_PLAN_FIELD: checkout.plan,
+        BILLING_EVENT_FIELD: event_id,
+        SUBSCRIPTION_STATUS_FIELD: status,
+    }
+    provider_token = subscription_id or _find_billing_value(data, {"customer_token"})
+    if provider_token:
+        provider_token = str(provider_token)[:255]
+        values[BILLING_CUSTOMER_FIELD] = provider_token
+    if status == "Active":
+        raw_period_end = _find_billing_value(
+            data, {"current_period_end", "period_end", "subscription_ends_at"}
+        )
+        period_end = None
+        if raw_period_end:
+            try:
+                period_end = get_datetime(raw_period_end)
+            except Exception:
+                period_end = None
+        if not period_end or period_end <= now_datetime():
+            period_end = add_to_date(
+                now_datetime(),
+                years=1 if checkout.plan == "annual" else 0,
+                months=1 if checkout.plan != "annual" else 0,
+            )
+        values[CURRENT_PERIOD_END_FIELD] = period_end
+    frappe.db.set_value("Company", company, values, update_modified=False)
+    frappe.db.set_value(
+        BILLING_CHECKOUT_DOCTYPE,
+        checkout_name,
+        {
+            "status": (
+                "Completed"
+                if status == "Active"
+                else "Cancelled"
+                if status == "Cancelled"
+                else "Failed"
+            ),
+            "provider_subscription_id": provider_token,
+            "last_event_id": event_id,
+        },
+        update_modified=False,
+    )
+    return {
+        "ok": True,
+        "duplicate": False,
+        "company": company,
+        "status": status,
+    }
 
 
 @frappe.whitelist()

@@ -89,6 +89,15 @@ class TestSubscriptionLifecycle(FrappeTestCase):
         with (
             patch.object(frappe.db, "get_value", return_value=values),
             patch.object(frappe.db, "set_value") as set_value,
+            patch.object(
+                api,
+                "_get_saas_settings",
+                return_value=frappe._dict(
+                    require_payment_method_on_signup=0,
+                    terms_url=None,
+                    privacy_url=None,
+                ),
+            ),
         ):
             subscription = api._subscription_payload("Company A")
         self.assertEqual(subscription["status"], "Past Due")
@@ -147,6 +156,52 @@ class TestSubscriptionLifecycle(FrappeTestCase):
                     privacy_consent=True,
                 )
         set_value.assert_not_called()
+
+    def test_safepay_event_requires_explicit_success(self):
+        self.assertIsNone(
+            api._safepay_event_status(
+                "subscription.created", {"status": "pending"}
+            )
+        )
+        self.assertEqual(
+            api._safepay_event_status(
+                "subscription.payment_succeeded", {"status": "paid"}
+            ),
+            "Active",
+        )
+        self.assertEqual(
+            api._safepay_event_status(
+                "subscription.cancelled", {"status": "cancelled"}
+            ),
+            "Cancelled",
+        )
+
+    def test_nested_checkout_reference_is_found(self):
+        payload = {"subscription": {"metadata": {"reference": "sprout_123"}}}
+        self.assertEqual(
+            api._find_billing_value(payload, {"reference"}), "sprout_123"
+        )
+
+    def test_safepay_checkout_url_contains_token_but_not_secret(self):
+        response = MagicMock()
+        response.read.return_value = b'{"data":"short-lived-token"}'
+        response.__enter__.return_value = response
+        settings = frappe._dict(
+            sandbox_mode=1,
+            secret_api_key="merchant-secret",
+        )
+        with patch.object(api.urllib.request, "urlopen", return_value=response):
+            url = api._create_safepay_subscription_url(
+                settings,
+                "plan_123",
+                "sprout_ref",
+                "https://example.com/success",
+                "https://example.com/cancel",
+            )
+        self.assertIn("sandbox.api.getsafepay.com/checkout/subscribe", url)
+        self.assertIn("auth_token=short-lived-token", url)
+        self.assertIn("reference=sprout_ref", url)
+        self.assertNotIn("merchant-secret", url)
 
 
 class TestTenantOwnership(FrappeTestCase):
@@ -581,6 +636,8 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "admin_set_subscription",
         "cancel_subscription",
         "billing_webhook",
+        "billing_checkout_return",
+        "safepay_webhook",
         "request_data_export",
         "request_data_deletion",
         "request_account_deletion",
