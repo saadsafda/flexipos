@@ -1,0 +1,32 @@
+{
+ "actions": [],
+ "autoname": "field:movement_id",
+ "creation": "2026-07-19 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["movement_id", "company", "register_id", "item", "sales_invoice", "offline_invoice_id", "movement_type", "qty_delta", "qty_before", "qty_after", "event_at"],
+ "fields": [
+  {"fieldname": "movement_id", "fieldtype": "Data", "hidden": 1, "label": "Movement ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "register_id", "fieldtype": "Data", "in_standard_filter": 1, "label": "Register ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "item", "fieldtype": "Link", "in_standard_filter": 1, "label": "Item", "options": "Item", "read_only": 1, "reqd": 1},
+  {"fieldname": "sales_invoice", "fieldtype": "Link", "label": "Sales Invoice", "options": "Sales Invoice", "read_only": 1, "reqd": 1},
+  {"fieldname": "offline_invoice_id", "fieldtype": "Data", "label": "Offline Invoice ID", "read_only": 1},
+  {"fieldname": "movement_type", "fieldtype": "Select", "in_list_view": 1, "label": "Movement Type", "options": "Sale\nRefund\nAdjustment", "read_only": 1, "reqd": 1},
+  {"fieldname": "qty_delta", "fieldtype": "Float", "label": "Quantity Delta", "read_only": 1, "reqd": 1},
+  {"fieldname": "qty_before", "fieldtype": "Float", "label": "Quantity Before", "read_only": 1, "reqd": 1},
+  {"fieldname": "qty_after", "fieldtype": "Float", "label": "Quantity After", "read_only": 1, "reqd": 1},
+  {"fieldname": "event_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Event At", "read_only": 1, "reqd": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-19 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Stock Movement",
+ "owner": "Administrator",
+ "permissions": [{"create": 0, "delete": 0, "read": 1, "role": "System Manager", "write": 0}],
+ "sort_field": "event_at",
+ "sort_order": "DESC",
+ "states": []
+}

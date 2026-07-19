@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import io
 import json
 import urllib.error
@@ -628,6 +629,24 @@ class TestTenantIsolationIntegration(FrappeTestCase):
 
 
 class TestAuthoritativePricing(FrappeTestCase):
+    def test_minor_unit_rounding_is_half_up(self):
+        self.assertEqual(api._money_minor("10.004"), 1000)
+        self.assertEqual(api._money_minor("10.005"), 1001)
+        self.assertEqual(api._money_minor("-10.005"), -1001)
+        self.assertEqual(str(api._money_decimal("3.335")), "3.34")
+
+    def test_minor_unit_contract_rejects_mismatch(self):
+        api._require_matching_minor(
+            {"amount_minor": 1001}, "amount_minor", "10.01", label="payment"
+        )
+        with self.assertRaises(frappe.ValidationError):
+            api._require_matching_minor(
+                {"amount_minor": 1000},
+                "amount_minor",
+                "10.01",
+                label="payment",
+            )
+
     def test_price_estimate_tolerance_is_small_and_finite(self):
         self.assertTrue(api._estimate_matches(100, 100.009))
         self.assertFalse(api._estimate_matches(100, 100.02))
@@ -694,6 +713,75 @@ class TestAuthoritativePricing(FrappeTestCase):
         self.assertEqual(resolved[0]["price"], 25)
 
 
+class TestFinancialIntegrity(FrappeTestCase):
+    def test_sale_requires_a_shift_covering_the_posting_time(self):
+        with patch.object(frappe.db, "sql", return_value=[]):
+            with self.assertRaises(frappe.ValidationError):
+                api._require_shift_covering_sale(
+                    "Company A", "register-1", "2026-07-19 10:00:00"
+                )
+        with patch.object(
+            frappe.db, "sql", return_value=[frappe._dict(name="shift-1")]
+        ):
+            self.assertEqual(
+                api._require_shift_covering_sale(
+                    "Company A", "register-1", "2026-07-19 10:00:00"
+                ),
+                "shift-1",
+            )
+
+    def test_audit_append_rejects_tampered_hash(self):
+        staff_user = frappe.session.user
+        details_json = '{"amount_minor":1005}'
+        payload = {
+            "id": "audit-1",
+            "company": "Company A",
+            "register_id": "register-1",
+            "staff_user": staff_user,
+            "event_type": "sale_recorded",
+            "entity_type": "offline_invoice",
+            "entity_id": "sale-1",
+            "details_json": details_json,
+            "previous_hash": "",
+            "created_at": "2026-07-19T10:00:00.000Z",
+        }
+        digest_input = json.dumps(
+            [
+                payload["id"],
+                payload["company"],
+                payload["register_id"],
+                staff_user,
+                payload["event_type"],
+                payload["entity_type"],
+                payload["entity_id"],
+                details_json,
+                "",
+                payload["created_at"],
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        payload["event_hash"] = hashlib.sha256(
+            digest_input.encode("utf-8")
+        ).hexdigest()
+        document = MagicMock()
+        with (
+            patch.object(frappe.db, "exists", return_value=False),
+            patch.object(frappe.db, "get_value", return_value=""),
+            patch.object(frappe, "get_doc", return_value=document),
+        ):
+            api._apply_audit_operation("Company A", "register-1", payload)
+        document.insert.assert_called_once_with(ignore_permissions=True)
+
+        payload["event_hash"] = "0" * 64
+        with (
+            patch.object(frappe.db, "exists", return_value=False),
+            patch.object(frappe.db, "get_value", return_value=""),
+            self.assertRaises(frappe.ValidationError),
+        ):
+            api._apply_audit_operation("Company A", "register-1", payload)
+
+
 class TestEndpointPermissionContract(FrappeTestCase):
     """Prevent future endpoints from accidentally losing their API guard."""
 
@@ -734,6 +822,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "save_modifier_group": {"_require_screen_access"},
         "delete_modifier_group": {"_require_screen_access"},
         "upload_image": {"_require_screen_access"},
+        "authorize_pos_payment": {"_require_screen_access"},
         "push_offline_invoices": {"_require_screen_access"},
         "update_kitchen_status": {"_require_screen_access"},
         "process_refund": {"_require_screen_access"},
@@ -752,6 +841,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "save_modifier_group": {"_require_document_company"},
         "delete_modifier_group": {"_require_document_company"},
         "upload_image": {"_require_document_company"},
+        "authorize_pos_payment": {"_get_user_company", "_get_pos_profile_for_company"},
         "_create_pos_invoice": {
             "_get_pos_profile_for_company",
             "_require_document_company",

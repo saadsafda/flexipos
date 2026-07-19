@@ -57,6 +57,7 @@ import secrets
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 import frappe
 from frappe import _
@@ -1779,6 +1780,18 @@ def _json_list(value, label):
     return result
 
 
+def _json_object(value, label):
+    if isinstance(value, dict):
+        return value
+    try:
+        result = json.loads(value or "{}")
+    except (TypeError, json.JSONDecodeError):
+        frappe.throw(_("Invalid {0}").format(label))
+    if not isinstance(result, dict):
+        frappe.throw(_("{0} must be an object").format(label))
+    return result
+
+
 def _setup_business(company_name, business_type, phone):
     """Shared setup core; caller owns commit/rollback."""
     company = _create_company(company_name, business_type, phone)
@@ -3063,6 +3076,10 @@ def sync_register_state(register_id, operations_json="[]"):
             if "shift" not in permissions:
                 frappe.throw(_("Not permitted to update shifts"), frappe.PermissionError)
             _apply_shift_operation(company, register_id, action, payload)
+        elif action == "audit_append":
+            if not permissions.intersection({"quick_sale", "shift"}):
+                frappe.throw(_("Not permitted to append financial audit events"), frappe.PermissionError)
+            _apply_audit_operation(company, register_id, payload)
         else:
             frappe.throw(_("Unknown register operation"))
 
@@ -3139,6 +3156,9 @@ def _apply_shift_operation(company, register_id, action, payload):
         movement_type = payload.get("type")
         if movement_type not in ("pay_in", "pay_out") or flt(payload.get("amount")) <= 0:
             frappe.throw(_("Cash movement is invalid"))
+        _require_matching_minor(
+            payload, "amount_minor", payload.get("amount"), label=_("cash movement amount")
+        )
         frappe.get_doc(
             {
                 "doctype": "FlexiPOS Cash Movement",
@@ -3163,6 +3183,8 @@ def _apply_shift_operation(company, register_id, action, payload):
         if frappe.db.get_value("FlexiPOS Shift", shift_id, "register_id") != register_id:
             frappe.throw(_("Shift belongs to another register"), frappe.PermissionError)
     status = "Closed" if payload.get("status") == "closed" else "Open"
+    if existing and frappe.db.get_value("FlexiPOS Shift", shift_id, "status") == "Closed" and status != "Closed":
+        frappe.throw(_("A closed shift cannot be reopened"))
     if status == "Open" and not existing and frappe.db.exists(
         "FlexiPOS Shift", {"company": company, "register_id": register_id, "status": "Open"}
     ):
@@ -3177,12 +3199,89 @@ def _apply_shift_operation(company, register_id, action, payload):
         "counted_amount": flt(payload.get("counted_amount")) if payload.get("counted_amount") is not None else None,
         "status": status,
     }
+    _require_matching_minor(
+        payload, "opening_float_minor", values["opening_float"], label=_("opening float")
+    )
+    if values["counted_amount"] is not None:
+        _require_matching_minor(
+            payload, "counted_amount_minor", values["counted_amount"], label=_("counted amount")
+        )
     if existing:
         frappe.db.set_value("FlexiPOS Shift", shift_id, values)
     else:
         frappe.get_doc(
             {"doctype": "FlexiPOS Shift", "shift_id": shift_id, **values}
         ).insert(ignore_permissions=True)
+
+
+def _apply_audit_operation(company, register_id, payload):
+    audit_id = (payload.get("id") or "").strip()
+    if not audit_id or len(audit_id) > 140:
+        frappe.throw(_("Financial audit ID is invalid"))
+    if frappe.db.exists("FlexiPOS Financial Audit", audit_id):
+        _require_document_company("FlexiPOS Financial Audit", audit_id, company)
+        return
+    if payload.get("company") != company or payload.get("register_id") != register_id:
+        frappe.throw(_("Financial audit event belongs to another register"), frappe.PermissionError)
+    staff_user = (payload.get("staff_user") or "").strip()
+    if staff_user and staff_user != frappe.session.user:
+        frappe.throw(_("Financial audit user does not match the active session"), frappe.PermissionError)
+    event_type = (payload.get("event_type") or "").strip()
+    entity_type = (payload.get("entity_type") or "").strip()
+    entity_id = (payload.get("entity_id") or "").strip()
+    details_json = payload.get("details_json") or "{}"
+    try:
+        details = json.loads(details_json)
+    except (TypeError, json.JSONDecodeError):
+        frappe.throw(_("Financial audit details are invalid"))
+    if not isinstance(details, dict) or not event_type or not entity_type or not entity_id:
+        frappe.throw(_("Financial audit event is incomplete"))
+    created_at = (payload.get("created_at") or "").strip()
+    event_hash = (payload.get("event_hash") or "").strip().lower()
+    previous_hash = (payload.get("previous_hash") or "").strip().lower()
+    latest_hash = frappe.db.get_value(
+        "FlexiPOS Financial Audit",
+        {"company": company, "register_id": register_id},
+        "event_hash",
+        order_by="event_at desc, creation desc",
+    ) or ""
+    if previous_hash != latest_hash:
+        frappe.throw(_("Financial audit chain is incomplete; sync older events first"))
+    digest_input = json.dumps(
+        [
+            audit_id,
+            company,
+            register_id,
+            staff_user,
+            event_type,
+            entity_type,
+            entity_id,
+            details_json,
+            previous_hash,
+            created_at,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    expected_hash = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(event_hash, expected_hash):
+        frappe.throw(_("Financial audit event failed integrity verification"))
+    frappe.get_doc(
+        {
+            "doctype": "FlexiPOS Financial Audit",
+            "audit_id": audit_id,
+            "company": company,
+            "register_id": register_id,
+            "staff_user": staff_user or frappe.session.user,
+            "event_type": event_type,
+            "entity_type": entity_type,
+            "entity_id": entity_id,
+            "details_json": json.dumps(details, ensure_ascii=False, separators=(",", ":")),
+            "previous_hash": previous_hash,
+            "event_hash": event_hash,
+            "event_at": get_datetime(created_at),
+        }
+    ).insert(ignore_permissions=True)
 
 
 def _shared_register_state(company, register_id, include_shift=False):
@@ -3269,7 +3368,7 @@ def _shared_register_state(company, register_id, include_shift=False):
 def _shared_kitchen_orders(company):
     invoices = frappe.get_all(
         "Sales Invoice",
-        filters={"company": company, "docstatus": 1, KITCHEN_STATUS_FIELD: ("in", ["Placed", "Preparing", "Ready"])},
+        filters={"company": company, "docstatus": 0, KITCHEN_STATUS_FIELD: ("in", KITCHEN_STATUSES)},
         fields=["name", OFFLINE_ID_FIELD, ORDER_TYPE_FIELD, TABLE_FIELD, KITCHEN_STATUS_FIELD, REGISTER_ID_FIELD, "customer", "posting_date", "posting_time", "net_total", "total_taxes_and_charges", "grand_total", "paid_amount"],
         order_by="posting_date, posting_time",
         limit_page_length=0,
@@ -3302,6 +3401,7 @@ def _shared_kitchen_orders(company):
                 "item_name": row.item_name,
                 "qty": flt(row.qty),
                 "rate": flt(row.rate),
+                "rate_minor": _money_minor(row.rate),
                 "tax_rate": taxes.get(row.item_code, 0),
             }
         )
@@ -3326,9 +3426,13 @@ def _shared_kitchen_orders(company):
             "kitchen_status": row.get(KITCHEN_STATUS_FIELD),
             "register_id": row.get(REGISTER_ID_FIELD),
             "server_net_total": flt(row.net_total),
+            "server_net_total_minor": _money_minor(row.net_total),
             "server_tax_total": flt(row.total_taxes_and_charges),
+            "server_tax_total_minor": _money_minor(row.total_taxes_and_charges),
             "server_grand_total": flt(row.grand_total),
+            "server_grand_total_minor": _money_minor(row.grand_total),
             "paid_amount": flt(row.paid_amount),
+            "paid_amount_minor": _money_minor(row.paid_amount),
             "payment_mode": payments.get(row.name, "Cash"),
             "items": by_invoice.get(row.name, []),
         }
@@ -3339,6 +3443,116 @@ def _shared_kitchen_orders(company):
 # ---------------------------------------------------------------------------
 # 3. push_offline_invoices
 # ---------------------------------------------------------------------------
+
+
+@frappe.whitelist()
+def authorize_pos_payment(mode_of_payment, amount_minor, register_id=None, provider_payload=None):
+    """Authorize one non-cash tender through a site-configured provider.
+
+    The provider implementation is deliberately server-side. Configure
+    ``flexipos_pos_payment_authorizer`` in site_config.json with a dotted
+    callable path. The callable receives only tenant/register/mode/minor units
+    and an opaque provider payload, and must return an explicit authorized
+    status plus a provider reference. Without a provider, non-cash payments
+    fail closed instead of being recorded as paid.
+    """
+    _require_screen_access("quick_sale")
+    company = _get_user_company()
+    _require_subscription_access(company)
+    user = frappe.session.user
+    register_id = _validate_register_id(
+        (register_id or frappe.db.get_value("User", user, DEVICE_ID_FIELD) or "").strip(),
+        user=user,
+    )
+    try:
+        amount_minor = int(amount_minor)
+    except (TypeError, ValueError):
+        frappe.throw(_("Payment amount is invalid"))
+    if amount_minor <= 0:
+        frappe.throw(_("Payment amount must be greater than zero"))
+
+    profile = _get_pos_profile_for_company(None, company, user)
+    allowed = {row.mode_of_payment for row in profile.payments if row.mode_of_payment}
+    mode = (mode_of_payment or "").strip()
+    if mode not in allowed:
+        frappe.throw(
+            _("Payment mode is not available for this POS Profile"),
+            frappe.PermissionError,
+        )
+    if mode.lower() == "cash":
+        frappe.throw(_("Cash does not require online authorization"))
+
+    authorizer_path = frappe.conf.get("flexipos_pos_payment_authorizer")
+    if not authorizer_path:
+        frappe.throw(
+            _("{0} payment authorization is not configured").format(mode)
+        )
+    payload = _json_object(provider_payload, "provider_payload") if provider_payload else {}
+    result = frappe.get_attr(authorizer_path)(
+        company=company,
+        register_id=register_id,
+        user=user,
+        mode_of_payment=mode,
+        amount_minor=amount_minor,
+        provider_payload=payload,
+    )
+    if not isinstance(result, dict) or str(result.get("status", "")).lower() != "authorized":
+        frappe.throw(_("Payment was not authorized"))
+    reference = str(result.get("reference") or "").strip()
+    if not reference:
+        frappe.throw(_("Payment provider returned no authorization reference"))
+
+    authorization_id = secrets.token_urlsafe(24)
+    doc = frappe.get_doc(
+        {
+            "doctype": "FlexiPOS Payment Authorization",
+            "authorization_id": authorization_id,
+            "company": company,
+            "register_id": register_id,
+            "staff_user": user,
+            "mode_of_payment": mode,
+            "amount": amount_minor / 100,
+            "amount_minor": amount_minor,
+            "provider": str(result.get("provider") or authorizer_path)[:140],
+            "provider_reference": reference[:140],
+            "status": "Authorized",
+            "expires_at": add_to_date(now_datetime(), minutes=10),
+        }
+    )
+    doc.flags.ignore_permissions = True
+    doc.insert()
+    return {
+        "authorization_id": authorization_id,
+        "status": "authorized",
+        "provider": doc.provider,
+        "transaction_reference": doc.provider_reference,
+        "amount_minor": amount_minor,
+        "expires_at": str(doc.expires_at),
+    }
+
+
+def _validated_payment_authorization(
+    authorization_id, *, company, register_id, mode, amount_minor
+):
+    authorization_id = (authorization_id or "").strip()
+    if not authorization_id:
+        frappe.throw(_("Non-cash payment requires provider authorization"))
+    authorization = frappe.get_doc(
+        "FlexiPOS Payment Authorization", authorization_id
+    )
+    if (
+        authorization.company != company
+        or authorization.register_id != register_id
+        or authorization.mode_of_payment != mode
+    ):
+        frappe.throw(_("Payment authorization is not valid for this sale"), frappe.PermissionError)
+    if authorization.status != "Authorized" or authorization.consumed_by:
+        frappe.throw(_("Payment authorization has already been used"))
+    if get_datetime(authorization.expires_at) < now_datetime():
+        frappe.throw(_("Payment authorization has expired"))
+    if cint(authorization.amount_minor) != amount_minor:
+        frappe.throw(_("Payment authorization amount does not match this sale"))
+    return authorization
 
 @frappe.whitelist()
 def push_offline_invoices(invoices_json):
@@ -3445,36 +3659,50 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
             )
             continue
 
-        existing = frappe.db.get_value(
-            "Sales Invoice",
-            {
-                OFFLINE_ID_FIELD: offline_id,
-                "company": allowed_company,
-            },
-            "name",
-        )
-        if existing:
-            totals = frappe.db.get_value(
-                "Sales Invoice",
-                existing,
-                ["net_total", "total_taxes_and_charges", "grand_total"],
-                as_dict=True,
-            )
-            results.append(
-                {
-                    "offline_invoice_id": offline_id,
-                    "status": "duplicate",
-                    "invoice": existing,
-                    "net_total": flt(totals.net_total),
-                    "tax_total": flt(totals.total_taxes_and_charges),
-                    "grand_total": flt(totals.grand_total),
-                }
-            )
-            continue
-
-        savepoint = "flexipos_invoice"
+        savepoint = f"flexipos_invoice_{len(results)}"
         frappe.db.savepoint(savepoint)
         try:
+            existing = frappe.db.get_value(
+                "Sales Invoice",
+                {
+                    OFFLINE_ID_FIELD: offline_id,
+                    "company": allowed_company,
+                },
+                ["name", "docstatus"],
+                as_dict=True,
+            )
+            if existing:
+                requested_state = (payload.get("order_state") or "paid").lower()
+                if cint(existing.docstatus) == 0 and requested_state in ("draft", "paid"):
+                    # Kitchen edits and settlement replace the non-accounting
+                    # draft inside this request's savepoint. The immutable audit
+                    # event retains the state transition and the offline id stays
+                    # the external identity/idempotency key.
+                    frappe.delete_doc(
+                        "Sales Invoice",
+                        existing.name,
+                        ignore_permissions=True,
+                        force=True,
+                    )
+                    existing = None
+            if existing:
+                totals = frappe.db.get_value(
+                    "Sales Invoice",
+                    existing.name,
+                    ["net_total", "total_taxes_and_charges", "grand_total"],
+                    as_dict=True,
+                )
+                results.append(
+                    {
+                        "offline_invoice_id": offline_id,
+                        "status": "duplicate",
+                        "invoice": existing.name,
+                        "net_total": flt(totals.net_total),
+                        "tax_total": flt(totals.total_taxes_and_charges),
+                        "grand_total": flt(totals.grand_total),
+                    }
+                )
+                continue
             doc = _create_pos_invoice(
                 payload,
                 offline_id,
@@ -3662,8 +3890,127 @@ def _get_output_tax_account(company):
 
 
 def _estimate_matches(server_value, client_value, tolerance=PRICE_TOLERANCE):
-    client_value = flt(client_value)
-    return math.isfinite(client_value) and abs(server_value - client_value) <= tolerance
+    try:
+        server_decimal = Decimal(str(server_value))
+        client_decimal = Decimal(str(client_value))
+        tolerance_decimal = Decimal(str(tolerance))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return (
+        server_decimal.is_finite()
+        and client_decimal.is_finite()
+        and abs(server_decimal - client_decimal) <= tolerance_decimal
+    )
+
+
+MONEY_QUANTUM = Decimal("0.01")
+
+
+def _decimal(value, *, label="amount"):
+    try:
+        result = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        frappe.throw(_("Invalid {0}").format(label))
+    if not result.is_finite():
+        frappe.throw(_("Invalid {0}").format(label))
+    return result
+
+
+def _money_minor(value):
+    """Convert a decimal amount to two-decimal minor units, half-up."""
+    return int(
+        (_decimal(value) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    )
+
+
+def _money_decimal(value):
+    return Decimal(_money_minor(value)) / Decimal("100")
+
+
+def _require_matching_minor(payload, key, decimal_value, *, label):
+    """Validate the v2 integer-money contract while accepting legacy clients."""
+    if key not in payload:
+        return
+    try:
+        supplied = int(payload.get(key))
+    except (TypeError, ValueError):
+        frappe.throw(_("Invalid {0}").format(label))
+    expected = _money_minor(decimal_value)
+    if supplied != expected:
+        frappe.throw(
+            _("{0} does not match the authoritative amount").format(label)
+        )
+
+
+def _require_shift_covering_sale(company, register_id, posting):
+    rows = frappe.db.sql(
+        """
+        SELECT name
+          FROM `tabFlexiPOS Shift`
+         WHERE company = %s
+           AND register_id = %s
+           AND opened_at <= %s
+           AND (
+             status = 'Open'
+             OR (status = 'Closed' AND closed_at IS NOT NULL AND closed_at >= %s)
+           )
+         ORDER BY opened_at DESC
+         LIMIT 1
+        """,
+        (company, register_id, posting, posting),
+        as_dict=True,
+    )
+    if not rows:
+        frappe.throw(_("No shift covers this sale on the selected register"))
+    return rows[0].name
+
+
+def _record_simple_stock_movements(doc, *, company, register_id, movement_type):
+    """Update the app's simple count and append an immutable movement ledger.
+
+    ERPNext's own Stock Ledger remains authoritative when ``update_stock`` is
+    enabled. This companion ledger covers merchants using FlexiPOS's simpler
+    per-item count and makes every adjustment attributable to a sale/refund.
+    """
+    sign = Decimal("-1") if movement_type == "Sale" else Decimal("1")
+    for index, row in enumerate(doc.items, start=1):
+        locked = frappe.db.sql(
+            f"SELECT `{STOCK_QTY_FIELD}` AS qty FROM `tabItem` WHERE name = %s FOR UPDATE",
+            row.item_code,
+            as_dict=True,
+        )
+        if not locked or locked[0].qty is None:
+            continue
+        before = _decimal(locked[0].qty, label=_("stock quantity"))
+        delta = sign * abs(_decimal(row.qty, label=_("stock movement quantity")))
+        after = before + delta
+        if after < 0:
+            frappe.throw(
+                _("Insufficient simple stock for item {0}").format(row.item_code)
+            )
+        frappe.db.set_value(
+            "Item", row.item_code, STOCK_QTY_FIELD, float(after)
+        )
+        movement_id = hashlib.sha256(
+            f"{doc.name}:{row.item_code}:{index}:{movement_type}".encode("utf-8")
+        ).hexdigest()
+        if not frappe.db.exists("FlexiPOS Stock Movement", movement_id):
+            frappe.get_doc(
+                {
+                    "doctype": "FlexiPOS Stock Movement",
+                    "movement_id": movement_id,
+                    "company": company,
+                    "register_id": register_id,
+                    "item": row.item_code,
+                    "sales_invoice": doc.name,
+                    "offline_invoice_id": doc.get(OFFLINE_ID_FIELD),
+                    "movement_type": movement_type,
+                    "qty_delta": float(delta),
+                    "qty_before": float(before),
+                    "qty_after": float(after),
+                    "event_at": now_datetime(),
+                }
+            ).insert(ignore_permissions=True)
 
 
 def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
@@ -3715,9 +4062,19 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     ):
         frappe.throw(_("Sale time is outside the allowed offline window"))
     order_type = payload.get("order_type")
-    # Only Dine-in/Takeaway orders go through the kitchen; Delivery
-    # (or no order type at all, e.g. non-restaurant businesses) skip it.
-    kitchen_status = "Placed" if order_type in ("Dine-in", "Takeaway") else None
+    order_state = (payload.get("order_state") or "paid").lower()
+    if order_state not in ("draft", "paid"):
+        frappe.throw(_("Invalid order state"))
+    requested_kitchen_status = (payload.get("kitchen_status") or "").strip()
+    if requested_kitchen_status and requested_kitchen_status not in KITCHEN_STATUSES:
+        frappe.throw(_("Invalid kitchen status"))
+    kitchen_status = (
+        requested_kitchen_status or "Placed"
+        if order_state == "draft" and order_type in ("Dine-in", "Takeaway")
+        else None
+    )
+    if order_state == "paid":
+        _require_shift_covering_sale(company, register_id, posting)
 
     doc = frappe.new_doc("Sales Invoice")
     doc.flags.ignore_pricing_rule = True
@@ -3725,13 +4082,13 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         {
             "company": company,
             "customer": profile.customer,
-            "is_pos": 1,
+            "is_pos": 1 if order_state == "paid" else 0,
             "pos_profile": profile.name,
             "set_posting_time": 1,
             "posting_date": posting.date(),
             "posting_time": posting.time(),
             "due_date": posting.date(),
-            "update_stock": cint(profile.update_stock),
+            "update_stock": cint(profile.update_stock) if order_state == "paid" else 0,
             "selling_price_list": profile.selling_price_list,
             OFFLINE_ID_FIELD: offline_id,
             ORDER_TYPE_FIELD: order_type,
@@ -3754,8 +4111,8 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         doc.branch = branch
 
     authoritative_lines = []
-    client_gross = 0
-    server_gross = 0
+    client_gross = Decimal("0")
+    server_gross = Decimal("0")
     for row in items:
         if not isinstance(row, dict):
             frappe.throw(_("Invoice item must be an object"))
@@ -3781,13 +4138,18 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         modifiers = _resolve_authoritative_modifiers(
             item_code, company, row.get("modifiers")
         )
-        server_rate = base_rate + sum(flt(m["price"]) for m in modifiers)
-        if not math.isfinite(server_rate) or server_rate < 0:
+        server_rate = _money_decimal(
+            base_rate + sum(flt(m["price"]) for m in modifiers)
+        )
+        if not server_rate.is_finite() or server_rate < 0:
             frappe.throw(_("The total price for item {0} is invalid").format(item_code))
         if "rate" not in row or not _estimate_matches(server_rate, row.get("rate")):
             frappe.throw(
                 _("Price changed for {0}. Refresh the catalog and retry the sale.").format(item_code)
             )
+        _require_matching_minor(
+            row, "rate_minor", server_rate, label=_("item rate")
+        )
         tax_rate = flt(item.get(TAX_RATE_FIELD))
         if not math.isfinite(tax_rate) or tax_rate < 0 or tax_rate > 100:
             frappe.throw(_("The tax rate for item {0} is invalid").format(item_code))
@@ -3797,8 +4159,17 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             frappe.throw(
                 _("Tax changed for {0}. Refresh the catalog and retry the sale.").format(item_code)
             )
-        client_gross += flt(row.get("rate")) * qty
-        server_gross += server_rate * qty
+        client_line = _decimal(row.get("rate"), label=_("item rate")) * _decimal(
+            qty, label=_("quantity")
+        )
+        server_line = server_rate * _decimal(
+            qty, label=_("quantity")
+        )
+        _require_matching_minor(
+            row, "amount_minor", server_line, label=_("line amount")
+        )
+        client_gross += client_line
+        server_gross += server_line
         description = (
             ", ".join(
                 f"{m.get('label')}"
@@ -3814,18 +4185,21 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             {
                 "item_code": item_code,
                 "qty": qty,
-                "rate": server_rate,
+                "rate": float(server_rate),
                 "uom": item.stock_uom,
                 "warehouse": profile.warehouse,
                 **({"description": description} if description else {}),
             },
         )
         authoritative_lines.append(
-            {"rate": server_rate, "tax_rate": tax_rate}
+            {"rate": float(server_rate), "tax_rate": tax_rate}
         )
 
-    if not _estimate_matches(server_gross, client_gross):
+    if abs(server_gross - client_gross) > MONEY_QUANTUM:
         frappe.throw(_("Sale total changed. Refresh the catalog and retry the sale."))
+    _require_matching_minor(
+        payload, "grand_total_minor", server_gross, label=_("sale total")
+    )
 
     doc.set_missing_values()
 
@@ -3859,34 +4233,90 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
 
     payments = payload.get("payments") or []
     doc.set("payments", [])
-    if not isinstance(payments, list) or len(payments) > 1:
-        frappe.throw(_("FlexiPOS sales require exactly one payment mode"))
+    if order_state == "draft":
+        if payments:
+            frappe.throw(_("Kitchen drafts cannot contain payments"))
+        doc.flags.ignore_permissions = True
+        doc.insert()
+        if doc.get(TABLE_FIELD) and order_type == "Dine-in":
+            _upsert_shared_table(
+                company,
+                doc.get(TABLE_FIELD),
+                "Occupied",
+                offline_id,
+                register_id,
+            )
+        return doc
+    if not isinstance(payments, list) or not payments or len(payments) > 5:
+        frappe.throw(_("FlexiPOS sales require between one and five payment lines"))
     allowed_payment_modes = [
         row.mode_of_payment for row in profile.payments if row.mode_of_payment
     ]
     if not allowed_payment_modes:
         frappe.throw(_("The POS Profile has no payment mode"))
-    payment = payments[0] if payments else {}
-    if not isinstance(payment, dict):
-        frappe.throw(_("Payment must be an object"))
-    mode = (payment.get("mode_of_payment") or allowed_payment_modes[0]).strip()
-    if mode not in allowed_payment_modes:
-        frappe.throw(
-            _("Payment mode is not available for this POS Profile"),
-            frappe.PermissionError,
-        )
     payable = flt(doc.rounded_total or doc.grand_total)
-    doc.append("payments", {"mode_of_payment": mode, "amount": payable})
+    _require_matching_minor(
+        payload, "grand_total_minor", payable, label=_("sale total")
+    )
+    payable_minor = _money_minor(payable)
+    applied_minor = 0
+    authorizations = []
+    for index, payment in enumerate(payments):
+        if not isinstance(payment, dict):
+            frappe.throw(_("Payment must be an object"))
+        mode = (payment.get("mode_of_payment") or allowed_payment_modes[0]).strip()
+        if mode not in allowed_payment_modes:
+            frappe.throw(
+                _("Payment mode is not available for this POS Profile"),
+                frappe.PermissionError,
+            )
+        if "amount_minor" in payment:
+            try:
+                amount_minor = int(payment.get("amount_minor"))
+            except (TypeError, ValueError):
+                frappe.throw(_("Payment amount is invalid"))
+        elif len(payments) == 1:
+            # Transitional compatibility for v1 cash clients.
+            amount_minor = payable_minor
+        else:
+            frappe.throw(_("Split payment lines require exact minor-unit amounts"))
+        if amount_minor <= 0:
+            frappe.throw(_("Payment amount must be greater than zero"))
+        amount = amount_minor / 100
+        _require_matching_minor(
+            payment, "amount_minor", amount, label=_("payment amount")
+        )
+        if mode.lower() != "cash":
+            authorization = _validated_payment_authorization(
+                payment.get("authorization_id"),
+                company=company,
+                register_id=register_id,
+                mode=mode,
+                amount_minor=amount_minor,
+            )
+            authorizations.append(authorization)
+        applied_minor += amount_minor
+        doc.append("payments", {"mode_of_payment": mode, "amount": amount})
+    if applied_minor != payable_minor:
+        frappe.throw(_("Payment lines must equal the exact sale total"))
 
     doc.flags.ignore_permissions = True
     doc.insert()
     doc.submit()
+    _record_simple_stock_movements(
+        doc, company=company, register_id=register_id, movement_type="Sale"
+    )
+    for authorization in authorizations:
+        authorization.db_set(
+            {"status": "Consumed", "consumed_by": doc.name},
+            update_modified=False,
+        )
     if doc.get(TABLE_FIELD) and order_type == "Dine-in":
         _upsert_shared_table(
             company,
             doc.get(TABLE_FIELD),
-            "Occupied",
-            offline_id,
+            "Free",
+            None,
             register_id,
         )
     return doc
@@ -3919,8 +4349,8 @@ def update_kitchen_status(invoice_name, status):
         _upsert_shared_table(
             company,
             table_no,
-            "Free" if status == "Served" else "Occupied",
-            None if status == "Served" else frappe.db.get_value("Sales Invoice", invoice_name, OFFLINE_ID_FIELD),
+            "Occupied",
+            frappe.db.get_value("Sales Invoice", invoice_name, OFFLINE_ID_FIELD),
             register_id,
         )
     return {"invoice": invoice_name, "kitchen_status": status}
@@ -4066,6 +4496,12 @@ def process_refund(invoice_name, items_json, reason=None):
     credit_note.flags.ignore_permissions = True
     credit_note.insert()
     credit_note.submit()
+    _record_simple_stock_movements(
+        credit_note,
+        company=company,
+        register_id=original.get(REGISTER_ID_FIELD) or "",
+        movement_type="Refund",
+    )
 
     return {
         "credit_note": credit_note.name,
