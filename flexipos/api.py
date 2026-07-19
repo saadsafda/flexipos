@@ -181,6 +181,7 @@ PIN_LOCKOUT_SECONDS = 300
 
 OTP_DOCTYPE = "FlexiPOS OTP"
 OTP_TTL_SECONDS = 600
+OTP_VERIFICATION_TTL_SECONDS = 300
 MAX_OTP_REQUESTS = 3  # per email per 15 minutes
 MAX_OTP_ATTEMPTS = 5  # wrong codes per email per 10 minutes
 
@@ -4704,18 +4705,36 @@ def request_login_otp(email, device_id):
 
 
 @frappe.whitelist(allow_guest=True)
-def verify_login_otp(email, otp, device_id, new_pin):
-    """Verify the code, bind this device + PIN to the account, and
-    return everything the app needs to finish onboarding."""
+def verify_login_otp(
+    email,
+    otp=None,
+    device_id=None,
+    new_pin=None,
+    verification_token=None,
+):
+    """Verify a login code and optionally finish device setup.
+
+    New clients call this twice: first with ``otp`` to receive a short-lived
+    verification token, then with that token plus ``new_pin``. Supplying the
+    code and PIN together remains supported for older app versions.
+    """
     email = (email or "").strip().lower()
     otp = (otp or "").strip()
     device_id = (device_id or "").strip()
     new_pin = (new_pin or "").strip()
+    verification_token = (verification_token or "").strip()
 
-    if not otp or not device_id:
-        frappe.throw(_("Code and device_id are required"))
-    if not new_pin.isdigit() or len(new_pin) != 4:
-        frappe.throw(_("PIN must be exactly 4 digits"))
+    if not email or not device_id:
+        frappe.throw(_("Email and device_id are required"))
+
+    if verification_token:
+        if not new_pin.isdigit() or len(new_pin) != 4:
+            frappe.throw(_("PIN must be exactly 4 digits"))
+        _consume_otp_verification_token(email, device_id, verification_token)
+        return _finish_otp_login(email, device_id, new_pin)
+
+    if not otp:
+        frappe.throw(_("Code is required"))
 
     attempts_key = f"flexipos_otp_verify:{email}"
     _rate_limit(attempts_key, MAX_OTP_ATTEMPTS, 600)
@@ -4741,6 +4760,56 @@ def verify_login_otp(email, otp, device_id, new_pin):
     frappe.db.set_value(OTP_DOCTYPE, record.name, "status", "Verified")
     frappe.cache().delete_value(attempts_key)
 
+    # Backward-compatible single-call flow for older app versions.
+    if new_pin:
+        if not new_pin.isdigit() or len(new_pin) != 4:
+            frappe.throw(_("PIN must be exactly 4 digits"))
+        return _finish_otp_login(email, device_id, new_pin)
+
+    verification_token = secrets.token_urlsafe(32)
+    token_key = _otp_verification_cache_key(verification_token)
+    frappe.cache().set_value(
+        token_key,
+        json.dumps({"email": email, "device_id": device_id}),
+        expires_in_sec=OTP_VERIFICATION_TTL_SECONDS,
+    )
+    return {
+        "verified": True,
+        "verification_token": verification_token,
+        "expires_in_seconds": OTP_VERIFICATION_TTL_SECONDS,
+    }
+
+
+def _otp_verification_cache_key(token):
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"flexipos_otp_verified:{digest}"
+
+
+def _consume_otp_verification_token(email, device_id, token):
+    token_key = _otp_verification_cache_key(token)
+    raw = frappe.cache().get_value(token_key)
+    if not raw:
+        frappe.throw(
+            _("Device verification has expired. Verify a new code."),
+            frappe.AuthenticationError,
+        )
+    try:
+        payload = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    if not (
+        secrets.compare_digest(str(payload.get("email") or ""), email)
+        and secrets.compare_digest(
+            str(payload.get("device_id") or ""), device_id
+        )
+    ):
+        frappe.throw(_("Invalid device verification"), frappe.AuthenticationError)
+    # Tokens are one-use. Delete before creating the session so the same
+    # verified code cannot bind multiple PINs or devices.
+    frappe.cache().delete_value(token_key)
+
+
+def _finish_otp_login(email, device_id, new_pin):
     # Bind this device + PIN (replaces any previous device binding).
     salt = secrets.token_hex(16)
     frappe.db.set_value(
