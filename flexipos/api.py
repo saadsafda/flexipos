@@ -58,6 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from uuid import UUID
 
 import frappe
 from frappe import _
@@ -75,12 +76,17 @@ BUSINESS_TYPES = ["Restaurant", "Pharmacy", "Retail", "Service", "Clothing", "Ba
 DEFAULT_COUNTRY = "Pakistan"
 DEFAULT_PRICE_LIST = "Standard Selling"
 WALK_IN_CUSTOMER = "Walk-in Customer"
+LOYALTY_EARN_MINOR_PER_POINT = 10000  # one point per 100 currency units
+LOYALTY_REDEMPTION_MINOR_PER_POINT = 100  # one currency unit per point
 
 OFFLINE_ID_FIELD = "flexipos_offline_id"
 ORDER_TYPE_FIELD = "flexipos_order_type"
 TABLE_FIELD = "flexipos_table_no"
 KITCHEN_STATUS_FIELD = "flexipos_kitchen_status"
 REGISTER_ID_FIELD = "flexipos_register_id"
+CUSTOMER_ID_FIELD = "flexipos_customer_id"
+ADJUSTMENTS_FIELD = "flexipos_adjustments_json"
+ITEM_MODIFIERS_FIELD = "flexipos_modifiers_json"
 KITCHEN_STATUSES = ["Placed", "Preparing", "Ready", "Served"]
 PIN_HASH_FIELD = "flexipos_pin_hash"
 DEVICE_ID_FIELD = "flexipos_device_id"
@@ -263,6 +269,35 @@ def setup_custom_fields():
                     "no_copy": 1,
                     "search_index": 1,
                     "insert_after": KITCHEN_STATUS_FIELD,
+                },
+                {
+                    "fieldname": CUSTOMER_ID_FIELD,
+                    "label": "FlexiPOS Customer ID",
+                    "fieldtype": "Data",
+                    "read_only": 1,
+                    "no_copy": 1,
+                    "search_index": 1,
+                    "insert_after": REGISTER_ID_FIELD,
+                },
+                {
+                    "fieldname": ADJUSTMENTS_FIELD,
+                    "label": "FlexiPOS Sale Adjustments (JSON)",
+                    "fieldtype": "Long Text",
+                    "read_only": 1,
+                    "no_copy": 1,
+                    "hidden": 1,
+                    "insert_after": CUSTOMER_ID_FIELD,
+                },
+            ],
+            "Sales Invoice Item": [
+                {
+                    "fieldname": ITEM_MODIFIERS_FIELD,
+                    "label": "FlexiPOS Modifiers (JSON)",
+                    "fieldtype": "Long Text",
+                    "read_only": 1,
+                    "no_copy": 1,
+                    "hidden": 1,
+                    "insert_after": "description",
                 },
             ],
             "Company": [
@@ -1995,7 +2030,304 @@ def _link_current_user(company):
 
 
 # ---------------------------------------------------------------------------
-# 2. sync_inventory
+# 2. Customers, promotions and loyalty
+# ---------------------------------------------------------------------------
+
+
+def _validate_client_uuid(value, label):
+    value = (value or "").strip()
+    try:
+        UUID(value)
+    except (ValueError, TypeError, AttributeError):
+        frappe.throw(_("Invalid {0}").format(label))
+    return value
+
+
+def _customer_payload(customer):
+    return {
+        "customer_id": customer.customer_id,
+        "company": customer.company,
+        "customer_name": customer.customer_name,
+        "phone": customer.phone or "",
+        "email": customer.email or "",
+        "loyalty_points": cint(customer.loyalty_points),
+        "disabled": cint(customer.disabled),
+        "modified": str(customer.modified),
+    }
+
+
+def _promotion_payload(promotion):
+    return {
+        "promotion_id": promotion.promotion_id,
+        "company": promotion.company,
+        "title": promotion.title,
+        "code": promotion.code,
+        "discount_type": promotion.discount_type.lower(),
+        "percentage_basis_points": cint(promotion.percentage_basis_points),
+        "fixed_amount_minor": cint(promotion.fixed_amount_minor),
+        "minimum_spend_minor": cint(promotion.minimum_spend_minor),
+        "maximum_discount_minor": cint(promotion.maximum_discount_minor) or None,
+        "starts_at": str(promotion.starts_at) if promotion.starts_at else None,
+        "ends_at": str(promotion.ends_at) if promotion.ends_at else None,
+        "active": cint(promotion.active),
+        "usage_limit": cint(promotion.usage_limit),
+        "used_count": cint(promotion.used_count),
+        "modified": str(promotion.modified),
+    }
+
+
+def _upsert_pos_customer(company, value):
+    if not isinstance(value, dict):
+        frappe.throw(_("Customer change must be an object"))
+    customer_id = _validate_client_uuid(value.get("customer_id"), _("customer ID"))
+    name = (value.get("customer_name") or "").strip()
+    phone = (value.get("phone") or "").strip()
+    email = (value.get("email") or "").strip().lower()
+    if not name or len(name) > 140:
+        frappe.throw(_("Customer name is required and must be 140 characters or fewer"))
+    if len(phone) > 40:
+        frappe.throw(_("Customer phone is too long"))
+    if email:
+        validate_email_address(email, throw=True)
+    disabled = cint(value.get("disabled"))
+
+    existing = frappe.db.get_value(
+        "FlexiPOS Customer",
+        customer_id,
+        ["company", "linked_customer"],
+        as_dict=True,
+    )
+    if existing and existing.company != company:
+        frappe.throw(_("Customer belongs to another business"), frappe.PermissionError)
+
+    linked_customer = existing.linked_customer if existing else None
+    if not linked_customer or not frappe.db.exists("Customer", linked_customer):
+        walk_in = frappe.get_doc("Customer", _ensure_walk_in_customer())
+        company_abbr = frappe.db.get_value("Company", company, "abbr") or "POS"
+        erp_name = f"{name} - {company_abbr} - {customer_id[:8]}"[:140]
+        linked = frappe.get_doc(
+            {
+                "doctype": "Customer",
+                "customer_name": erp_name,
+                "customer_type": "Individual",
+                "customer_group": walk_in.customer_group,
+                "territory": walk_in.territory,
+                "mobile_no": phone or None,
+                "email_id": email or None,
+                "disabled": disabled,
+            }
+        )
+        linked.insert(ignore_permissions=True)
+        linked_customer = linked.name
+    else:
+        frappe.db.set_value(
+            "Customer",
+            linked_customer,
+            {"mobile_no": phone or None, "email_id": email or None, "disabled": disabled},
+        )
+
+    if existing:
+        doc = frappe.get_doc("FlexiPOS Customer", customer_id)
+        doc.update(
+            {
+                "customer_name": name,
+                "phone": phone,
+                "email": email,
+                "linked_customer": linked_customer,
+                "disabled": disabled,
+            }
+        )
+        doc.flags.ignore_permissions = True
+        doc.save()
+    else:
+        doc = frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Customer",
+                "customer_id": customer_id,
+                "company": company,
+                "customer_name": name,
+                "phone": phone,
+                "email": email,
+                "loyalty_points": 0,
+                "linked_customer": linked_customer,
+                "disabled": disabled,
+            }
+        )
+        doc.insert(ignore_permissions=True)
+    return doc
+
+
+def _upsert_pos_promotion(company, value):
+    if not isinstance(value, dict):
+        frappe.throw(_("Promotion change must be an object"))
+    promotion_id = (value.get("promotion_id") or "").strip()
+    if not promotion_id or len(promotion_id) > 140:
+        frappe.throw(_("Promotion ID is invalid"))
+    existing = frappe.db.exists("FlexiPOS Promotion", promotion_id)
+    if existing:
+        _require_document_company(
+            "FlexiPOS Promotion", promotion_id, company, label=_("Promotion")
+        )
+        doc = frappe.get_doc("FlexiPOS Promotion", promotion_id)
+    else:
+        doc = frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Promotion",
+                "promotion_id": promotion_id,
+                "company": company,
+                "used_count": 0,
+            }
+        )
+    title = (value.get("title") or "").strip()
+    if not title or len(title) > 140:
+        frappe.throw(_("Promotion title is required"))
+    doc.update(
+        {
+            "title": title,
+            "code": (value.get("code") or "").strip().upper(),
+            "discount_type": (
+                "Percentage"
+                if str(value.get("discount_type")).lower() == "percentage"
+                else "Fixed"
+            ),
+            "percentage_basis_points": cint(value.get("percentage_basis_points")),
+            "fixed_amount_minor": cint(value.get("fixed_amount_minor")),
+            "minimum_spend_minor": cint(value.get("minimum_spend_minor")),
+            "maximum_discount_minor": cint(value.get("maximum_discount_minor")),
+            "starts_at": get_datetime(value.get("starts_at"))
+            if value.get("starts_at")
+            else None,
+            "ends_at": get_datetime(value.get("ends_at"))
+            if value.get("ends_at")
+            else None,
+            "active": cint(value.get("active")),
+            "usage_limit": cint(value.get("usage_limit")),
+        }
+    )
+    doc.flags.ignore_permissions = True
+    if existing:
+        doc.save()
+    else:
+        doc.insert(ignore_permissions=True)
+    return doc
+
+
+@frappe.whitelist()
+def sync_commerce(customers_json="[]", promotions_json="[]"):
+    """Merge offline customer edits and return the tenant commerce catalog."""
+    _require_screen_access("quick_sale")
+    company = _get_user_company()
+    changes = _json_list(customers_json, _("customer changes"))
+    if len(changes) > 200:
+        frappe.throw(_("Too many customer changes in one sync"))
+    promotion_changes = _json_list(promotions_json, _("promotion changes"))
+    if len(promotion_changes) > 200:
+        frappe.throw(_("Too many promotion changes in one sync"))
+    if promotion_changes and _effective_role(frappe.session.user) not in (
+        ADMIN_ROLE,
+        "Manager",
+    ):
+        frappe.throw(
+            _("Only an Admin or Manager can change promotions"),
+            frappe.PermissionError,
+        )
+
+    results = []
+    for value in changes:
+        customer_id = value.get("customer_id") if isinstance(value, dict) else None
+        savepoint = f"flexipos_customer_{len(results)}"
+        frappe.db.savepoint(savepoint)
+        try:
+            customer = _upsert_pos_customer(company, value)
+            results.append({"customer_id": customer.name, "status": "success", **_customer_payload(customer)})
+        except Exception as exc:
+            frappe.db.rollback(save_point=savepoint)
+            results.append(
+                {
+                    "customer_id": customer_id,
+                    "status": "failed",
+                    "error": str(exc)[:300],
+                }
+            )
+
+    promotion_results = []
+    for value in promotion_changes:
+        promotion_id = value.get("promotion_id") if isinstance(value, dict) else None
+        savepoint = f"flexipos_promotion_{len(promotion_results)}"
+        frappe.db.savepoint(savepoint)
+        try:
+            promotion = _upsert_pos_promotion(company, value)
+            promotion_results.append(
+                {
+                    "promotion_id": promotion.name,
+                    "status": "success",
+                    **_promotion_payload(promotion),
+                }
+            )
+        except Exception as exc:
+            frappe.db.rollback(save_point=savepoint)
+            promotion_results.append(
+                {
+                    "promotion_id": promotion_id,
+                    "status": "failed",
+                    "error": str(exc)[:300],
+                }
+            )
+
+    customers = frappe.get_all(
+        "FlexiPOS Customer",
+        filters={"company": company},
+        fields=[
+            "customer_id",
+            "company",
+            "customer_name",
+            "phone",
+            "email",
+            "loyalty_points",
+            "disabled",
+            "modified",
+        ],
+        order_by="customer_name asc",
+        limit_page_length=0,
+    )
+    promotions = frappe.get_all(
+        "FlexiPOS Promotion",
+        filters={"company": company},
+        fields=[
+            "promotion_id",
+            "company",
+            "title",
+            "code",
+            "discount_type",
+            "percentage_basis_points",
+            "fixed_amount_minor",
+            "minimum_spend_minor",
+            "maximum_discount_minor",
+            "starts_at",
+            "ends_at",
+            "active",
+            "usage_limit",
+            "used_count",
+            "modified",
+        ],
+        order_by="title asc",
+        limit_page_length=0,
+    )
+    return {
+        "results": results,
+        "promotion_results": promotion_results,
+        "customers": [dict(value) for value in customers],
+        "promotions": [dict(value) for value in promotions],
+        "loyalty": {
+            "earn_minor_per_point": LOYALTY_EARN_MINOR_PER_POINT,
+            "redemption_minor_per_point": LOYALTY_REDEMPTION_MINOR_PER_POINT,
+        },
+        "server_time": str(now_datetime()),
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. sync_inventory
 # ---------------------------------------------------------------------------
 
 @frappe.whitelist()
@@ -3122,12 +3454,23 @@ def _apply_held_operation(company, register_id, action, payload):
     lines = payload.get("lines")
     if not isinstance(lines, list) or not lines or len(lines) > 100:
         frappe.throw(_("Held order lines are invalid"))
+    customer_id = (payload.get("customer_id") or "Walk-in Customer").strip()
+    customer_name = (payload.get("customer_name") or "Walk-in Customer").strip()
+    if customer_id != "Walk-in Customer":
+        _require_document_company("FlexiPOS Customer", customer_id, company)
+        customer_name = frappe.db.get_value("FlexiPOS Customer", customer_id, "customer_name")
+    adjustments = payload.get("adjustments") or []
+    if not isinstance(adjustments, list) or len(adjustments) > 3:
+        frappe.throw(_("Held order adjustments are invalid"))
     values = {
         "company": company,
         "register_id": register_id,
         "staff_name": (payload.get("staff_name") or "").strip()[:140],
         "order_type": payload.get("order_type") if payload.get("order_type") in ("Dine-in", "Takeaway", "Delivery") else "Dine-in",
         "table_no": (payload.get("table_no") or "").strip()[:140] or None,
+        "customer_id": customer_id,
+        "customer_name": customer_name[:140],
+        "adjustments_json": json.dumps(adjustments),
         "grand_total": flt(payload.get("grand_total")),
         "item_count": flt(payload.get("item_count")),
         "lines_json": json.dumps(lines),
@@ -3295,7 +3638,7 @@ def _shared_register_state(company, register_id, include_shift=False):
     held = frappe.get_all(
         "FlexiPOS Held Order",
         filters={"company": company},
-        fields=["offline_id", "order_type", "table_no", "staff_name", "grand_total", "item_count", "lines_json", "held_at", "register_id"],
+        fields=["offline_id", "order_type", "table_no", "staff_name", "customer_id", "customer_name", "adjustments_json", "grand_total", "item_count", "lines_json", "held_at", "register_id"],
         order_by="held_at",
         limit_page_length=0,
     )
@@ -3309,6 +3652,9 @@ def _shared_register_state(company, register_id, include_shift=False):
                 "order_type": row.order_type,
                 "table_no": row.table_no,
                 "staff_name": row.staff_name,
+                "customer_id": row.customer_id or "Walk-in Customer",
+                "customer_name": row.customer_name or "Walk-in Customer",
+                "adjustments": json.loads(row.adjustments_json or "[]"),
                 "grand_total": flt(row.grand_total),
                 "item_count": flt(row.item_count),
                 "lines": json.loads(row.lines_json or "[]"),
@@ -3369,7 +3715,7 @@ def _shared_kitchen_orders(company):
     invoices = frappe.get_all(
         "Sales Invoice",
         filters={"company": company, "docstatus": 0, KITCHEN_STATUS_FIELD: ("in", KITCHEN_STATUSES)},
-        fields=["name", OFFLINE_ID_FIELD, ORDER_TYPE_FIELD, TABLE_FIELD, KITCHEN_STATUS_FIELD, REGISTER_ID_FIELD, "customer", "posting_date", "posting_time", "net_total", "total_taxes_and_charges", "grand_total", "paid_amount"],
+        fields=["name", OFFLINE_ID_FIELD, ORDER_TYPE_FIELD, TABLE_FIELD, KITCHEN_STATUS_FIELD, REGISTER_ID_FIELD, CUSTOMER_ID_FIELD, ADJUSTMENTS_FIELD, "customer", "posting_date", "posting_time", "net_total", "total_taxes_and_charges", "discount_amount", "grand_total", "paid_amount"],
         order_by="posting_date, posting_time",
         limit_page_length=0,
     )
@@ -3379,7 +3725,7 @@ def _shared_kitchen_orders(company):
     item_rows = frappe.get_all(
         "Sales Invoice Item",
         filters={"parent": ("in", names), "parenttype": "Sales Invoice"},
-        fields=["parent", "item_code", "item_name", "qty", "rate", "idx"],
+        fields=["parent", "item_code", "item_name", "qty", "rate", ITEM_MODIFIERS_FIELD, "idx"],
         order_by="parent, idx",
         limit_page_length=0,
     )
@@ -3403,6 +3749,7 @@ def _shared_kitchen_orders(company):
                 "rate": flt(row.rate),
                 "rate_minor": _money_minor(row.rate),
                 "tax_rate": taxes.get(row.item_code, 0),
+                "modifiers": json.loads(row.get(ITEM_MODIFIERS_FIELD) or "[]"),
             }
         )
     payments = {
@@ -3415,11 +3762,37 @@ def _shared_kitchen_orders(company):
             limit_page_length=0,
         )
     }
+    customer_ids = {
+        row.get(CUSTOMER_ID_FIELD)
+        for row in invoices
+        if row.get(CUSTOMER_ID_FIELD)
+        and row.get(CUSTOMER_ID_FIELD) != WALK_IN_CUSTOMER
+    }
+    customer_names = {
+        row.name: row.customer_name
+        for row in frappe.get_all(
+            "FlexiPOS Customer",
+            filters={"name": ("in", list(customer_ids)), "company": company},
+            fields=["name", "customer_name"],
+            limit_page_length=0,
+        )
+    } if customer_ids else {}
     return [
         {
             "offline_invoice_id": row.get(OFFLINE_ID_FIELD) or f"server:{row.name}",
             "erp_invoice_name": row.name,
-            "customer": row.customer,
+            "customer": row.get(CUSTOMER_ID_FIELD) or WALK_IN_CUSTOMER,
+            "customer_name": customer_names.get(
+                row.get(CUSTOMER_ID_FIELD), WALK_IN_CUSTOMER
+            ),
+            "adjustments": json.loads(row.get(ADJUSTMENTS_FIELD) or "[]"),
+            "discount_total": abs(flt(row.discount_amount)),
+            "discount_total_minor": abs(_money_minor(row.discount_amount)),
+            "loyalty_points_redeemed": sum(
+                cint(value.get("loyalty_points"))
+                for value in json.loads(row.get(ADJUSTMENTS_FIELD) or "[]")
+                if isinstance(value, dict) and value.get("type") == "loyalty"
+            ),
             "posting_datetime": f"{row.posting_date} {row.posting_time}",
             "order_type": row.get(ORDER_TYPE_FIELD),
             "table_no": row.get(TABLE_FIELD),
@@ -3689,8 +4062,21 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                 totals = frappe.db.get_value(
                     "Sales Invoice",
                     existing.name,
-                    ["net_total", "total_taxes_and_charges", "grand_total"],
+                    [
+                        "net_total",
+                        "total_taxes_and_charges",
+                        "grand_total",
+                        CUSTOMER_ID_FIELD,
+                    ],
                     as_dict=True,
+                )
+                customer_id = totals.get(CUSTOMER_ID_FIELD) or WALK_IN_CUSTOMER
+                loyalty_points = (
+                    frappe.db.get_value(
+                        "FlexiPOS Customer", customer_id, "loyalty_points"
+                    )
+                    if customer_id != WALK_IN_CUSTOMER
+                    else None
                 )
                 results.append(
                     {
@@ -3700,6 +4086,8 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                         "net_total": flt(totals.net_total),
                         "tax_total": flt(totals.total_taxes_and_charges),
                         "grand_total": flt(totals.grand_total),
+                        "customer_id": customer_id,
+                        "loyalty_points": loyalty_points,
                     }
                 )
                 continue
@@ -3709,6 +4097,7 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                 user=user,
                 allowed_company=allowed_company,
             )
+            customer_id = doc.get(CUSTOMER_ID_FIELD) or WALK_IN_CUSTOMER
             results.append(
                 {
                     "offline_invoice_id": offline_id,
@@ -3717,6 +4106,10 @@ def _process_invoice_batch(invoices, user, allowed_company=None):
                     "net_total": flt(doc.net_total),
                     "tax_total": flt(doc.total_taxes_and_charges),
                     "grand_total": flt(doc.grand_total),
+                    "customer_id": customer_id,
+                    "loyalty_points": getattr(
+                        doc, "_flexipos_loyalty_points", None
+                    ),
                 }
             )
         except Exception as e:
@@ -4013,6 +4406,338 @@ def _record_simple_stock_movements(doc, *, company, register_id, movement_type):
             ).insert(ignore_permissions=True)
 
 
+def _resolve_sale_customer(company, profile, requested_customer):
+    customer_id = (requested_customer or WALK_IN_CUSTOMER).strip()
+    if customer_id == WALK_IN_CUSTOMER:
+        return customer_id, profile.customer, None
+    customer = frappe.get_doc("FlexiPOS Customer", customer_id)
+    if customer.company != company or customer.disabled:
+        frappe.throw(
+            _("Customer is not available for this business"),
+            frappe.PermissionError,
+        )
+    if not customer.linked_customer or not frappe.db.exists(
+        "Customer", customer.linked_customer
+    ):
+        frappe.throw(_("Customer account is not ready for sales"))
+    return customer_id, customer.linked_customer, customer
+
+
+def _resolve_sale_adjustments(
+    payload,
+    *,
+    company,
+    customer,
+    server_gross_minor,
+    posting,
+    user,
+):
+    requested = payload.get("adjustments") or []
+    if not isinstance(requested, list) or len(requested) > 3:
+        frappe.throw(_("Sale adjustments must be a list of at most three entries"))
+    seen = set()
+    resolved = []
+    promotion = None
+    loyalty_points = 0
+    total_minor = 0
+    for value in requested:
+        if not isinstance(value, dict):
+            frappe.throw(_("Sale adjustment must be an object"))
+        adjustment_type = (value.get("type") or "").strip().lower()
+        if adjustment_type not in ("manual", "promotion", "loyalty"):
+            frappe.throw(_("Unknown sale adjustment"))
+        if adjustment_type in seen:
+            frappe.throw(_("Only one adjustment of each type is allowed"))
+        seen.add(adjustment_type)
+        try:
+            client_amount_minor = int(value.get("amount_minor"))
+        except (TypeError, ValueError):
+            frappe.throw(_("Discount amount is invalid"))
+        if client_amount_minor <= 0:
+            frappe.throw(_("Discount amount must be greater than zero"))
+
+        if adjustment_type == "manual":
+            if _effective_role(user) not in (ADMIN_ROLE, "Manager"):
+                frappe.throw(
+                    _("Only an Admin or Manager can apply a manual discount"),
+                    frappe.PermissionError,
+                )
+            reason = (value.get("reason") or "").strip()
+            if len(reason) < 3 or len(reason) > 280:
+                frappe.throw(_("A manual discount reason is required"))
+            amount_minor = client_amount_minor
+            label = _("Manual discount")
+            reference = None
+        elif adjustment_type == "promotion":
+            promotion_id = (value.get("reference") or "").strip()
+            if not promotion_id:
+                frappe.throw(_("Promotion reference is required"))
+            locked = frappe.db.sql(
+                "SELECT name FROM `tabFlexiPOS Promotion` WHERE name = %s FOR UPDATE",
+                promotion_id,
+                as_dict=True,
+            )
+            if not locked:
+                frappe.throw(_("Promotion no longer exists"))
+            promotion = frappe.get_doc("FlexiPOS Promotion", promotion_id)
+            if promotion.company != company or not promotion.active:
+                frappe.throw(
+                    _("Promotion is not available for this business"),
+                    frappe.PermissionError,
+                )
+            if promotion.starts_at and posting < get_datetime(promotion.starts_at):
+                frappe.throw(_("Promotion has not started"))
+            if promotion.ends_at and posting > get_datetime(promotion.ends_at):
+                frappe.throw(_("Promotion has expired"))
+            if cint(promotion.usage_limit) and cint(promotion.used_count) >= cint(
+                promotion.usage_limit
+            ):
+                frappe.throw(_("Promotion usage limit has been reached"))
+            if server_gross_minor < cint(promotion.minimum_spend_minor):
+                frappe.throw(_("Sale does not meet the promotion minimum spend"))
+            if promotion.discount_type == "Percentage":
+                amount_minor = int(
+                    (
+                        Decimal(server_gross_minor)
+                        * Decimal(cint(promotion.percentage_basis_points))
+                        / Decimal(10000)
+                    ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                )
+            else:
+                amount_minor = cint(promotion.fixed_amount_minor)
+            maximum = cint(promotion.maximum_discount_minor)
+            if maximum:
+                amount_minor = min(amount_minor, maximum)
+            amount_minor = min(amount_minor, server_gross_minor)
+            if client_amount_minor != amount_minor:
+                frappe.throw(_("Promotion value changed. Reapply it and retry."))
+            label = promotion.title
+            reference = promotion.name
+            reason = None
+        else:
+            if customer is None:
+                frappe.throw(_("Choose a customer before redeeming loyalty points"))
+            try:
+                loyalty_points = int(value.get("loyalty_points"))
+            except (TypeError, ValueError):
+                frappe.throw(_("Loyalty points are invalid"))
+            if loyalty_points <= 0:
+                frappe.throw(_("Loyalty points must be greater than zero"))
+            locked = frappe.db.sql(
+                "SELECT loyalty_points FROM `tabFlexiPOS Customer` WHERE name = %s FOR UPDATE",
+                customer.name,
+                as_dict=True,
+            )
+            if not locked or loyalty_points > cint(locked[0].loyalty_points):
+                frappe.throw(_("Customer does not have enough loyalty points"))
+            amount_minor = loyalty_points * LOYALTY_REDEMPTION_MINOR_PER_POINT
+            if client_amount_minor != amount_minor:
+                frappe.throw(_("Loyalty redemption value changed. Reapply it and retry."))
+            label = _("{0} loyalty points").format(loyalty_points)
+            reference = customer.name
+            reason = None
+
+        total_minor += amount_minor
+        resolved.append(
+            {
+                "type": adjustment_type,
+                "label": label,
+                "amount_minor": amount_minor,
+                "reference": reference,
+                "reason": reason,
+                "loyalty_points": loyalty_points if adjustment_type == "loyalty" else 0,
+            }
+        )
+
+    if total_minor >= server_gross_minor and total_minor:
+        frappe.throw(_("Discounts must leave a positive amount due"))
+    supplied_discount = cint(payload.get("discount_total_minor"))
+    if supplied_discount != total_minor:
+        frappe.throw(_("Discount total does not match the authoritative amount"))
+    return resolved, total_minor, promotion, loyalty_points
+
+
+def _record_loyalty_activity(
+    customer,
+    *,
+    doc,
+    company,
+    register_id,
+    offline_id,
+    redeemed,
+    earned,
+):
+    if customer is None:
+        return None
+    locked = frappe.db.sql(
+        "SELECT loyalty_points FROM `tabFlexiPOS Customer` WHERE name = %s FOR UPDATE",
+        customer.name,
+        as_dict=True,
+    )
+    balance = cint(locked[0].loyalty_points)
+    for reason, delta in (("Redeemed", -redeemed), ("Earned", earned)):
+        if not delta:
+            continue
+        balance += delta
+        if balance < 0:
+            frappe.throw(_("Customer loyalty balance changed before this sale synced"))
+        entry_id = hashlib.sha256(
+            f"{offline_id}:{reason.lower()}".encode("utf-8")
+        ).hexdigest()
+        if not frappe.db.exists("FlexiPOS Loyalty Entry", entry_id):
+            frappe.get_doc(
+                {
+                    "doctype": "FlexiPOS Loyalty Entry",
+                    "entry_id": entry_id,
+                    "company": company,
+                    "customer": customer.name,
+                    "offline_invoice_id": offline_id,
+                    "sales_invoice": doc.name,
+                    "register_id": register_id,
+                    "points_delta": delta,
+                    "balance_after": balance,
+                    "reason": reason,
+                    "event_at": now_datetime(),
+                }
+            ).insert(ignore_permissions=True)
+    frappe.db.set_value(
+        "FlexiPOS Customer", customer.name, "loyalty_points", balance,
+        update_modified=False,
+    )
+    return balance
+
+
+def _prorated_points(points, refunded_minor, original_minor):
+    if points <= 0 or refunded_minor <= 0 or original_minor <= 0:
+        return 0
+    ratio = min(refunded_minor, original_minor)
+    return min(
+        points,
+        int(
+            (
+                Decimal(points) * Decimal(ratio) / Decimal(original_minor)
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        ),
+    )
+
+
+def _record_loyalty_refund(original, credit_note, company):
+    """Reverse earned points and restore redeemed points proportionally.
+
+    Entries are append-only and based on the cumulative submitted refund
+    amount, so multiple partial refunds converge to the exact full reversal.
+    """
+    customer_id = original.get(CUSTOMER_ID_FIELD)
+    offline_id = original.get(OFFLINE_ID_FIELD)
+    if not customer_id or customer_id == WALK_IN_CUSTOMER or not offline_id:
+        return None
+    _require_document_company("FlexiPOS Customer", customer_id, company)
+    source_entries = frappe.get_all(
+        "FlexiPOS Loyalty Entry",
+        filters={
+            "company": company,
+            "customer": customer_id,
+            "offline_invoice_id": offline_id,
+        },
+        fields=["reason", "points_delta"],
+        limit_page_length=0,
+    )
+    earned = sum(
+        cint(row.points_delta)
+        for row in source_entries
+        if row.reason == "Earned" and cint(row.points_delta) > 0
+    )
+    redeemed = sum(
+        -cint(row.points_delta)
+        for row in source_entries
+        if row.reason == "Redeemed" and cint(row.points_delta) < 0
+    )
+    if not earned and not redeemed:
+        return frappe.db.get_value(
+            "FlexiPOS Customer", customer_id, "loyalty_points"
+        )
+
+    original_minor = abs(_money_minor(original.grand_total))
+    refunded_totals = frappe.get_all(
+        "Sales Invoice",
+        filters={
+            "return_against": original.name,
+            "company": company,
+            "docstatus": 1,
+            "is_return": 1,
+        },
+        pluck="grand_total",
+        limit_page_length=0,
+    )
+    refunded_minor = sum(abs(_money_minor(value)) for value in refunded_totals)
+    desired_earned_reversal = _prorated_points(
+        earned, refunded_minor, original_minor
+    )
+    desired_redeemed_restoration = _prorated_points(
+        redeemed, refunded_minor, original_minor
+    )
+    already_reversed = sum(
+        -cint(row.points_delta)
+        for row in source_entries
+        if row.reason == "Reversal" and cint(row.points_delta) < 0
+    )
+    already_restored = sum(
+        cint(row.points_delta)
+        for row in source_entries
+        if row.reason == "Reversal" and cint(row.points_delta) > 0
+    )
+    earned_delta = max(desired_earned_reversal - already_reversed, 0)
+    restored_delta = max(desired_redeemed_restoration - already_restored, 0)
+    if not earned_delta and not restored_delta:
+        return frappe.db.get_value(
+            "FlexiPOS Customer", customer_id, "loyalty_points"
+        )
+
+    locked = frappe.db.sql(
+        "SELECT loyalty_points FROM `tabFlexiPOS Customer` WHERE name = %s FOR UPDATE",
+        customer_id,
+        as_dict=True,
+    )
+    if not locked:
+        frappe.throw(_("Customer loyalty account no longer exists"))
+    balance = cint(locked[0].loyalty_points)
+    for suffix, delta in (
+        ("earned-reversal", -earned_delta),
+        ("redeemed-restoration", restored_delta),
+    ):
+        if not delta:
+            continue
+        entry_id = hashlib.sha256(
+            f"{credit_note.name}:{suffix}".encode("utf-8")
+        ).hexdigest()
+        if frappe.db.exists("FlexiPOS Loyalty Entry", entry_id):
+            continue
+        balance += delta
+        frappe.get_doc(
+            {
+                "doctype": "FlexiPOS Loyalty Entry",
+                "entry_id": entry_id,
+                "company": company,
+                "customer": customer_id,
+                "offline_invoice_id": offline_id,
+                "sales_invoice": credit_note.name,
+                "register_id": original.get(REGISTER_ID_FIELD) or "server",
+                "points_delta": delta,
+                "balance_after": balance,
+                "reason": "Reversal",
+                "event_at": now_datetime(),
+            }
+        ).insert(ignore_permissions=True)
+    frappe.db.set_value(
+        "FlexiPOS Customer",
+        customer_id,
+        "loyalty_points",
+        balance,
+        update_modified=False,
+    )
+    return balance
+
+
 def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     company = (payload.get("company") or "").strip()
     if not company or company != allowed_company:
@@ -4031,12 +4756,11 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         register_id = frappe.db.get_value("User", user, DEVICE_ID_FIELD)
     register_id = _validate_register_id(register_id, user=user)
 
-    requested_customer = (payload.get("customer") or "").strip()
-    if requested_customer and requested_customer != profile.customer:
-        frappe.throw(
-            _("Customer is not available for this POS Profile"),
-            frappe.PermissionError,
-        )
+    customer_id, invoice_customer, flexipos_customer = _resolve_sale_customer(
+        company,
+        profile,
+        payload.get("customer"),
+    )
 
     items = payload.get("items") or []
     if not isinstance(items, list) or not items:
@@ -4081,7 +4805,7 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     doc.update(
         {
             "company": company,
-            "customer": profile.customer,
+            "customer": invoice_customer,
             "is_pos": 1 if order_state == "paid" else 0,
             "pos_profile": profile.name,
             "set_posting_time": 1,
@@ -4095,6 +4819,7 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             TABLE_FIELD: payload.get("table_no"),
             KITCHEN_STATUS_FIELD: kitchen_status,
             REGISTER_ID_FIELD: register_id,
+            CUSTOMER_ID_FIELD: customer_id,
         }
     )
     branch = (payload.get("branch") or "").strip()
@@ -4132,7 +4857,7 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             item_code,
             profile.selling_price_list,
             item.stock_uom,
-            profile.customer,
+            invoice_customer,
             server_now.date(),
         )
         modifiers = _resolve_authoritative_modifiers(
@@ -4188,6 +4913,9 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
                 "rate": float(server_rate),
                 "uom": item.stock_uom,
                 "warehouse": profile.warehouse,
+                ITEM_MODIFIERS_FIELD: json.dumps(
+                    modifiers, ensure_ascii=False, separators=(",", ":")
+                ),
                 **({"description": description} if description else {}),
             },
         )
@@ -4198,7 +4926,25 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
     if abs(server_gross - client_gross) > MONEY_QUANTUM:
         frappe.throw(_("Sale total changed. Refresh the catalog and retry the sale."))
     _require_matching_minor(
-        payload, "grand_total_minor", server_gross, label=_("sale total")
+        payload, "gross_total_minor", server_gross, label=_("gross sale total")
+    )
+    server_gross_minor = _money_minor(server_gross)
+    (
+        resolved_adjustments,
+        discount_minor,
+        applied_promotion,
+        loyalty_points_redeemed,
+    ) = _resolve_sale_adjustments(
+        payload,
+        company=company,
+        customer=flexipos_customer,
+        server_gross_minor=server_gross_minor,
+        posting=posting,
+        user=user,
+    )
+    doc.set(
+        ADJUSTMENTS_FIELD,
+        json.dumps(resolved_adjustments, ensure_ascii=False, separators=(",", ":")),
     )
 
     doc.set_missing_values()
@@ -4230,6 +4976,10 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         )
 
     doc.run_method("calculate_taxes_and_totals")
+    if discount_minor:
+        doc.apply_discount_on = "Grand Total"
+        doc.discount_amount = discount_minor / 100
+        doc.run_method("calculate_taxes_and_totals")
 
     payments = payload.get("payments") or []
     doc.set("payments", [])
@@ -4259,6 +5009,15 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
         payload, "grand_total_minor", payable, label=_("sale total")
     )
     payable_minor = _money_minor(payable)
+    expected_earned = (
+        payable_minor // LOYALTY_EARN_MINOR_PER_POINT
+        if flexipos_customer is not None
+        else 0
+    )
+    if cint(payload.get("loyalty_points_redeemed")) != loyalty_points_redeemed:
+        frappe.throw(_("Loyalty redemption total does not match this sale"))
+    if cint(payload.get("loyalty_points_earned")) != expected_earned:
+        frappe.throw(_("Loyalty earning total does not match this sale"))
     applied_minor = 0
     authorizations = []
     for index, payment in enumerate(payments):
@@ -4311,6 +5070,23 @@ def _create_pos_invoice(payload, offline_id, *, user, allowed_company):
             {"status": "Consumed", "consumed_by": doc.name},
             update_modified=False,
         )
+    if applied_promotion is not None:
+        applied_promotion.db_set(
+            "used_count", cint(applied_promotion.used_count) + 1,
+            update_modified=False,
+        )
+    loyalty_balance = _record_loyalty_activity(
+        flexipos_customer,
+        doc=doc,
+        company=company,
+        register_id=register_id,
+        offline_id=offline_id,
+        redeemed=loyalty_points_redeemed,
+        earned=expected_earned,
+    )
+    doc._flexipos_customer_id = customer_id
+    doc._flexipos_loyalty_points = loyalty_balance
+    doc._flexipos_adjustments = resolved_adjustments
     if doc.get(TABLE_FIELD) and order_type == "Dine-in":
         _upsert_shared_table(
             company,
@@ -4407,7 +5183,11 @@ def process_refund(invoice_name, items_json, reason=None):
             label=_("POS Profile"),
         )
 
-    sold_qty = {row.item_code: flt(row.qty) for row in original.items}
+    sold_qty = {}
+    for source_row in original.items:
+        sold_qty[source_row.item_code] = (
+            sold_qty.get(source_row.item_code, 0) + flt(source_row.qty)
+        )
     already_refunded = _refunded_qty_by_item(invoice_name, company)
 
     return_rows = []
@@ -4454,6 +5234,8 @@ def process_refund(invoice_name, items_json, reason=None):
             "remarks": f"Refund — {reason.strip()}" if reason and reason.strip() else "Refund",
             ORDER_TYPE_FIELD: original.get(ORDER_TYPE_FIELD),
             TABLE_FIELD: original.get(TABLE_FIELD),
+            REGISTER_ID_FIELD: original.get(REGISTER_ID_FIELD),
+            CUSTOMER_ID_FIELD: original.get(CUSTOMER_ID_FIELD),
         }
     )
 
@@ -4477,11 +5259,68 @@ def process_refund(invoice_name, items_json, reason=None):
                 "uom": source_row.uom,
                 "warehouse": source_row.warehouse,
                 "description": source_row.description,
+                "item_tax_rate": source_row.item_tax_rate,
             },
         )
         refund_total += flt(source_row.rate) * qty
 
     credit_note.set_missing_values()
+    credit_note.set("taxes", [])
+    for source_tax in original.taxes:
+        credit_note.append(
+            "taxes",
+            {
+                "charge_type": source_tax.charge_type,
+                "account_head": source_tax.account_head,
+                "description": source_tax.description,
+                "rate": source_tax.rate,
+                "included_in_print_rate": source_tax.included_in_print_rate,
+                "cost_center": source_tax.cost_center,
+            },
+        )
+    original_gross_minor = sum(
+        _money_minor(_decimal(row.rate) * _decimal(row.qty))
+        for row in original.items
+    )
+    cumulative_refund_gross_minor = sum(
+        _money_minor(
+            _decimal(source_row.rate)
+            * _decimal(
+                already_refunded.get(item_code, 0)
+                + next(
+                    (qty for requested_code, qty in return_rows if requested_code == item_code),
+                    0,
+                )
+            )
+        )
+        for item_code, source_row in original_rows.items()
+    )
+    original_discount_minor = abs(_money_minor(original.discount_amount or 0))
+    if original_discount_minor and original_gross_minor:
+        desired_cumulative_discount = int(
+            (
+                Decimal(original_discount_minor)
+                * Decimal(min(cumulative_refund_gross_minor, original_gross_minor))
+                / Decimal(original_gross_minor)
+            ).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+        prior_credit_notes = frappe.get_all(
+            "Sales Invoice",
+            filters={
+                "return_against": original.name,
+                "company": company,
+                "docstatus": 1,
+                "is_return": 1,
+            },
+            pluck="discount_amount",
+        )
+        prior_discount_minor = sum(
+            abs(_money_minor(value)) for value in prior_credit_notes
+        )
+        credit_note.apply_discount_on = original.apply_discount_on or "Grand Total"
+        credit_note.discount_amount = -max(
+            desired_cumulative_discount - prior_discount_minor, 0
+        ) / 100
     credit_note.run_method("calculate_taxes_and_totals")
 
     original_tender = (
@@ -4502,11 +5341,13 @@ def process_refund(invoice_name, items_json, reason=None):
         register_id=original.get(REGISTER_ID_FIELD) or "",
         movement_type="Refund",
     )
+    loyalty_balance = _record_loyalty_refund(original, credit_note, company)
 
     return {
         "credit_note": credit_note.name,
         "refund_amount": flt(-credit_note.grand_total),
         "tender": original_tender,
+        "loyalty_points": loyalty_balance,
     }
 
 
@@ -4633,7 +5474,13 @@ def get_order_history(limit=100):
 @frappe.whitelist()
 def register_device_pin(pin, device_id):
     """Called once from a logged-in session to bind this device + PIN to
-    the current user, enabling verify_pin_login afterwards."""
+    the current user, enabling verify_pin_login afterwards.
+
+    A self-serve tenant is not operational until this first PIN is created,
+    so its configured free trial starts here rather than being consumed while
+    the owner is still completing onboarding. Re-registering a PIN (including
+    on a replacement device) never extends or revives a trial.
+    """
     pin = (pin or "").strip()
     device_id = (device_id or "").strip()
     if not pin.isdigit() or len(pin) != 4:
@@ -4641,17 +5488,48 @@ def register_device_pin(pin, device_id):
     if not device_id:
         frappe.throw(_("device_id is required"))
 
+    user = frappe.session.user
+    existing_pin = frappe.db.get_value("User", user, PIN_HASH_FIELD)
+    company = _get_user_company()
+
     salt = secrets.token_hex(16)
     frappe.db.set_value(
         "User",
-        frappe.session.user,
+        user,
         {
             PIN_HASH_FIELD: f"{salt}${_hash_pin(pin, salt)}",
             DEVICE_ID_FIELD: device_id,
         },
         update_modified=False,
     )
-    return {"registered": True, "user": frappe.session.user}
+
+    # Company creation happens before the type-setup and PIN screens. Start
+    # the trial only when the first device is actually usable. Past Due is
+    # accepted here solely for an unfinished first-time signup whose earlier
+    # provisional trial timestamp elapsed before PIN activation.
+    status = frappe.db.get_value("Company", company, SUBSCRIPTION_STATUS_FIELD)
+    if (
+        not existing_pin
+        and status in ("Trialing", "Past Due")
+        and _is_company_owner(user, company)
+    ):
+        frappe.db.set_value(
+            "Company",
+            company,
+            {
+                SUBSCRIPTION_STATUS_FIELD: "Trialing",
+                TRIAL_ENDS_FIELD: add_to_date(
+                    now_datetime(), days=_default_trial_days()
+                ),
+            },
+            update_modified=False,
+        )
+
+    return {
+        "registered": True,
+        "user": user,
+        **_subscription_client_payload(company),
+    }
 
 
 @frappe.whitelist(allow_guest=True)

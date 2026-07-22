@@ -11,7 +11,21 @@ from uuid import uuid4
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from flexipos import api
+from flexipos import api, security
+
+
+class TestSecurityHeaders(FrappeTestCase):
+    def test_https_security_headers_are_added_to_responses(self):
+        security.add_security_headers()
+
+        self.assertEqual(
+            frappe.local.response_headers.get("Strict-Transport-Security"),
+            "max-age=31536000; includeSubDomains",
+        )
+        self.assertEqual(
+            frappe.local.response_headers.get("X-Content-Type-Options"),
+            "nosniff",
+        )
 
 
 class TestScreenPermissionGuards(FrappeTestCase):
@@ -76,6 +90,86 @@ class TestScreenPermissionGuards(FrappeTestCase):
 
 
 class TestSubscriptionLifecycle(FrappeTestCase):
+    def test_first_pin_starts_configured_trial_and_returns_fresh_status(self):
+        fixed_now = frappe.utils.get_datetime("2026-07-22 12:00:00")
+        lifecycle = {
+            "subscription_status": "trialing",
+            "trial_ends_at": "2026-08-21 12:00:00",
+            "billing_setup_required": False,
+        }
+        with (
+            patch.object(
+                frappe.db,
+                "get_value",
+                side_effect=[None, "Past Due"],
+            ),
+            patch.object(frappe.db, "set_value") as set_value,
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_is_company_owner", return_value=True),
+            patch.object(api, "_default_trial_days", return_value=30),
+            patch.object(api, "now_datetime", return_value=fixed_now),
+            patch.object(
+                api,
+                "_subscription_client_payload",
+                return_value=lifecycle,
+            ),
+        ):
+            result = api.register_device_pin("1234", "device-a")
+
+        company_update = set_value.call_args_list[1]
+        self.assertEqual(company_update.args[:2], ("Company", "Company A"))
+        self.assertEqual(
+            company_update.args[2][api.SUBSCRIPTION_STATUS_FIELD], "Trialing"
+        )
+        self.assertEqual(
+            company_update.args[2][api.TRIAL_ENDS_FIELD],
+            frappe.utils.add_to_date(fixed_now, days=30),
+        )
+        self.assertEqual(result["subscription_status"], "trialing")
+        self.assertFalse(result["billing_setup_required"])
+
+    def test_replacing_an_existing_pin_never_extends_trial(self):
+        with (
+            patch.object(
+                frappe.db,
+                "get_value",
+                side_effect=["salt$existing-hash", "Past Due"],
+            ),
+            patch.object(frappe.db, "set_value") as set_value,
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(
+                api,
+                "_subscription_client_payload",
+                return_value={"subscription_status": "past_due"},
+            ),
+        ):
+            api.register_device_pin("1234", "device-b")
+
+        self.assertEqual(set_value.call_count, 1)
+        self.assertEqual(set_value.call_args.args[0], "User")
+
+    def test_staff_first_pin_cannot_revive_an_expired_tenant(self):
+        with (
+            patch.object(
+                frappe.db,
+                "get_value",
+                side_effect=[None, "Past Due"],
+            ),
+            patch.object(frappe.db, "set_value") as set_value,
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_is_company_owner", return_value=False),
+            patch.object(
+                api,
+                "_subscription_client_payload",
+                return_value={"subscription_status": "past_due"},
+            ),
+        ):
+            result = api.register_device_pin("1234", "staff-device")
+
+        self.assertEqual(set_value.call_count, 1)
+        self.assertEqual(set_value.call_args.args[0], "User")
+        self.assertEqual(result["subscription_status"], "past_due")
+
     def test_expired_trial_is_marked_past_due(self):
         values = frappe._dict(
             flexipos_subscription_status="Trialing",
@@ -713,6 +807,189 @@ class TestAuthoritativePricing(FrappeTestCase):
         self.assertEqual(resolved[0]["price"], 25)
 
 
+class TestCommerceIntegrity(FrappeTestCase):
+    def test_staff_cannot_push_promotion_changes(self):
+        with (
+            patch.object(api, "_require_screen_access"),
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_effective_role", return_value="Staff"),
+        ):
+            with self.assertRaises(frappe.PermissionError):
+                api.sync_commerce(
+                    promotions_json=json.dumps(
+                        [{"promotion_id": "promotion-1", "title": "Offer"}]
+                    )
+                )
+
+    def test_partial_loyalty_refunds_round_and_converge(self):
+        self.assertEqual(api._prorated_points(7, 5000, 10000), 4)
+        self.assertEqual(api._prorated_points(7, 10000, 10000), 7)
+        self.assertEqual(api._prorated_points(7, 15000, 10000), 7)
+
+    def test_shared_kitchen_order_keeps_customer_adjustments_and_modifiers(self):
+        invoice = frappe._dict(
+            name="SINV-DRAFT-1",
+            flexipos_offline_id="draft-1",
+            flexipos_order_type="Dine-in",
+            flexipos_table_no="4",
+            flexipos_kitchen_status="Placed",
+            flexipos_register_id="register-1",
+            flexipos_customer_id="customer-1",
+            flexipos_adjustments_json=json.dumps(
+                [
+                    {
+                        "type": "promotion",
+                        "label": "Summer 10%",
+                        "amount_minor": 1000,
+                        "reference": "promotion-1",
+                    }
+                ]
+            ),
+            customer="ERP-CUSTOMER-1",
+            posting_date="2026-07-22",
+            posting_time="12:00:00",
+            net_total=90,
+            total_taxes_and_charges=0,
+            discount_amount=10,
+            grand_total=90,
+            paid_amount=0,
+        )
+        item = frappe._dict(
+            parent=invoice.name,
+            item_code="ITEM-1",
+            item_name="Burger",
+            qty=1,
+            rate=100,
+            flexipos_modifiers_json=json.dumps(
+                [{"group": "Extras", "label": "Cheese", "price": 5}]
+            ),
+            idx=1,
+        )
+        with patch.object(
+            frappe,
+            "get_all",
+            side_effect=[
+                [invoice],
+                [item],
+                [frappe._dict(name="ITEM-1", flexipos_tax_rate=0)],
+                [],
+                [frappe._dict(name="customer-1", customer_name="Ayesha Khan")],
+            ],
+        ):
+            result = api._shared_kitchen_orders("Company A")
+
+        self.assertEqual(result[0]["customer"], "customer-1")
+        self.assertEqual(result[0]["customer_name"], "Ayesha Khan")
+        self.assertEqual(result[0]["discount_total_minor"], 1000)
+        self.assertEqual(result[0]["adjustments"][0]["reference"], "promotion-1")
+        self.assertEqual(result[0]["items"][0]["modifiers"][0]["label"], "Cheese")
+
+    def test_customer_selection_rejects_cross_tenant_customer(self):
+        profile = frappe._dict(customer="Walk-in Customer")
+        customer = frappe._dict(
+            name="customer-1",
+            company="Company B",
+            disabled=0,
+            linked_customer="ERP-CUSTOMER-1",
+        )
+        with patch.object(frappe, "get_doc", return_value=customer):
+            with self.assertRaises(frappe.PermissionError):
+                api._resolve_sale_customer("Company A", profile, "customer-1")
+
+    def test_promotion_is_recalculated_and_capped_by_the_server(self):
+        promotion = frappe._dict(
+            name="promotion-1",
+            company="Company A",
+            active=1,
+            title="Launch discount",
+            starts_at=None,
+            ends_at=None,
+            usage_limit=0,
+            used_count=0,
+            minimum_spend_minor=10000,
+            discount_type="Percentage",
+            percentage_basis_points=1250,
+            fixed_amount_minor=0,
+            maximum_discount_minor=1000,
+        )
+        payload = {
+            "adjustments": [
+                {
+                    "type": "promotion",
+                    "reference": "promotion-1",
+                    "amount_minor": 1000,
+                }
+            ],
+            "discount_total_minor": 1000,
+        }
+        with (
+            patch.object(
+                frappe.db,
+                "sql",
+                return_value=[frappe._dict(name="promotion-1")],
+            ),
+            patch.object(frappe, "get_doc", return_value=promotion),
+        ):
+            resolved, total, selected, redeemed = api._resolve_sale_adjustments(
+                payload,
+                company="Company A",
+                customer=None,
+                server_gross_minor=10005,
+                posting=frappe.utils.get_datetime("2026-07-22 12:00:00"),
+                user="cashier@example.test",
+            )
+
+        self.assertEqual(total, 1000)
+        self.assertEqual(resolved[0]["amount_minor"], 1000)
+        self.assertEqual(selected.name, "promotion-1")
+        self.assertEqual(redeemed, 0)
+
+    def test_loyalty_redemption_locks_and_rejects_stale_balance(self):
+        customer = frappe._dict(name="customer-1")
+        payload = {
+            "adjustments": [
+                {
+                    "type": "loyalty",
+                    "amount_minor": 500,
+                    "loyalty_points": 5,
+                }
+            ],
+            "discount_total_minor": 500,
+        }
+        with patch.object(
+            frappe.db,
+            "sql",
+            return_value=[frappe._dict(loyalty_points=4)],
+        ):
+            with self.assertRaises(frappe.ValidationError):
+                api._resolve_sale_adjustments(
+                    payload,
+                    company="Company A",
+                    customer=customer,
+                    server_gross_minor=10000,
+                    posting=frappe.utils.get_datetime("2026-07-22 12:00:00"),
+                    user="cashier@example.test",
+                )
+
+    def test_manual_discount_requires_manager_and_a_reason(self):
+        payload = {
+            "adjustments": [
+                {"type": "manual", "amount_minor": 100, "reason": "Late order"}
+            ],
+            "discount_total_minor": 100,
+        }
+        with patch.object(api, "_effective_role", return_value="Staff"):
+            with self.assertRaises(frappe.PermissionError):
+                api._resolve_sale_adjustments(
+                    payload,
+                    company="Company A",
+                    customer=None,
+                    server_gross_minor=10000,
+                    posting=frappe.utils.get_datetime("2026-07-22 12:00:00"),
+                    user="cashier@example.test",
+                )
+
+
 class TestFinancialIntegrity(FrappeTestCase):
     def test_sale_requires_a_shift_covering_the_posting_time(self):
         with patch.object(frappe.db, "sql", return_value=[]):
@@ -814,6 +1091,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
 
     required_guards: ClassVar[dict[str, set[str]]] = {
         "setup_new_business": {"_require_business_setup_access"},
+        "sync_commerce": {"_require_screen_access"},
         "sync_inventory": {"_require_any_screen_access"},
         "save_business_setup": {"_require_screen_access", "_require_admin"},
         "sync_register_state": {"_require_any_screen_access"},
@@ -835,6 +1113,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
 
     ownership_guards: ClassVar[dict[str, set[str]]] = {
         "get_my_business": {"_get_user_company", "_get_pos_profile_for_company"},
+        "sync_commerce": {"_get_user_company"},
         "save_item": {"_require_document_company"},
         "sync_register_state": {"_get_user_company"},
         "_assign_modifier_groups": {"_require_document_company"},

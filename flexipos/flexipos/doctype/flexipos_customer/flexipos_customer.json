@@ -1,0 +1,29 @@
+{
+ "actions": [],
+ "autoname": "field:customer_id",
+ "creation": "2026-07-22 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["customer_id", "company", "customer_name", "phone", "email", "loyalty_points", "linked_customer", "disabled"],
+ "fields": [
+  {"fieldname": "customer_id", "fieldtype": "Data", "hidden": 1, "label": "Customer ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "customer_name", "fieldtype": "Data", "in_list_view": 1, "label": "Customer Name", "reqd": 1},
+  {"fieldname": "phone", "fieldtype": "Data", "in_list_view": 1, "label": "Phone"},
+  {"fieldname": "email", "fieldtype": "Data", "label": "Email", "options": "Email"},
+  {"default": "0", "fieldname": "loyalty_points", "fieldtype": "Int", "in_list_view": 1, "label": "Loyalty Points", "read_only": 1},
+  {"fieldname": "linked_customer", "fieldtype": "Link", "label": "ERPNext Customer", "options": "Customer", "read_only": 1},
+  {"default": "0", "fieldname": "disabled", "fieldtype": "Check", "label": "Disabled"}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-22 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Customer",
+ "owner": "Administrator",
+ "permissions": [{"create": 0, "delete": 0, "read": 1, "role": "System Manager", "write": 0}],
+ "sort_field": "customer_name",
+ "sort_order": "ASC",
+ "states": []
+}

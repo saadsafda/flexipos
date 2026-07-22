@@ -189,7 +189,7 @@ scheduler_events = {
 # Request Events
 # ----------------
 # before_request = ["flexipos.utils.before_request"]
-# after_request = ["flexipos.utils.after_request"]
+after_request = ["flexipos.security.add_security_headers"]
 
 # Job Events
 # ----------

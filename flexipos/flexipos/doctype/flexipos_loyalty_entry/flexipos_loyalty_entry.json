@@ -1,0 +1,31 @@
+{
+ "actions": [],
+ "autoname": "field:entry_id",
+ "creation": "2026-07-22 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["entry_id", "company", "customer", "offline_invoice_id", "sales_invoice", "register_id", "points_delta", "balance_after", "reason", "event_at"],
+ "fields": [
+  {"fieldname": "entry_id", "fieldtype": "Data", "hidden": 1, "label": "Entry ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "customer", "fieldtype": "Link", "in_standard_filter": 1, "label": "Customer", "options": "FlexiPOS Customer", "read_only": 1, "reqd": 1},
+  {"fieldname": "offline_invoice_id", "fieldtype": "Data", "label": "Offline Invoice ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "sales_invoice", "fieldtype": "Link", "label": "Sales Invoice", "options": "Sales Invoice", "read_only": 1, "reqd": 1},
+  {"fieldname": "register_id", "fieldtype": "Data", "label": "Register ID", "read_only": 1, "reqd": 1},
+  {"fieldname": "points_delta", "fieldtype": "Int", "label": "Points Delta", "read_only": 1, "reqd": 1},
+  {"fieldname": "balance_after", "fieldtype": "Int", "label": "Balance After", "read_only": 1, "reqd": 1},
+  {"fieldname": "reason", "fieldtype": "Select", "label": "Reason", "options": "Earned\nRedeemed\nAdjustment\nReversal", "read_only": 1, "reqd": 1},
+  {"fieldname": "event_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Event At", "read_only": 1, "reqd": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-22 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Loyalty Entry",
+ "owner": "Administrator",
+ "permissions": [{"create": 0, "delete": 0, "read": 1, "role": "System Manager", "write": 0}],
+ "sort_field": "event_at",
+ "sort_order": "DESC",
+ "states": []
+}
