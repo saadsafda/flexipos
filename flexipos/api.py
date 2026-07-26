@@ -1034,8 +1034,10 @@ def saas_list_tenants(limit=200, start=0):
     start = max(0, cint(start))
     rows = frappe.get_all(
         "Company",
-        fields=["name", "company_name", SUBSCRIPTION_STATUS_FIELD, TRIAL_ENDS_FIELD,
+        fields=["name", "company_name", "creation", "modified",
+                "flexipos_business_type", SUBSCRIPTION_STATUS_FIELD, TRIAL_ENDS_FIELD,
                 CURRENT_PERIOD_END_FIELD, BILLING_PROVIDER_FIELD, BILLING_PLAN_FIELD,
+                BILLING_EMAIL_FIELD,
                 DELETION_REQUESTED_FIELD, RETENTION_UNTIL_FIELD],
         order_by="creation desc",
         limit_start=start,
@@ -1043,7 +1045,14 @@ def saas_list_tenants(limit=200, start=0):
     )
     return {
         "tenants": [
-            {"company": row.name, "company_name": row.company_name, **_subscription_payload(row.name)}
+            {
+                "company": row.name,
+                "company_name": row.company_name,
+                "business_type": row.get("flexipos_business_type"),
+                "created_at": str(row.creation) if row.creation else None,
+                "modified_at": str(row.modified) if row.modified else None,
+                **_subscription_payload(row.name),
+            }
             for row in rows
         ],
         "default_trial_days": _default_trial_days(),

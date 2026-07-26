@@ -102,6 +102,63 @@ class TestLaunchNicheScope(FrappeTestCase):
                 api._validate_launch_business_type(value)
 
 
+class TestSaaSOperatorPortal(FrappeTestCase):
+    def test_tenant_list_includes_safe_operator_metadata(self):
+        row = frappe._dict(
+            name="Company A",
+            company_name="Company A",
+            creation="2026-07-01 10:00:00",
+            modified="2026-07-26 10:00:00",
+            flexipos_business_type="Restaurant",
+        )
+        with (
+            patch.object(api, "_require_saas_operator"),
+            patch.object(frappe, "get_all", return_value=[row]),
+            patch.object(
+                api,
+                "_subscription_payload",
+                return_value={
+                    "status": "Trialing",
+                    "trial_ends_on": "2026-08-01 10:00:00",
+                    "billing_email": "billing@example.com",
+                },
+            ),
+            patch.object(api, "_default_trial_days", return_value=30),
+        ):
+            result = api.saas_list_tenants(limit=500)
+
+        self.assertEqual(result["default_trial_days"], 30)
+        self.assertEqual(result["tenants"][0]["company"], "Company A")
+        self.assertEqual(result["tenants"][0]["business_type"], "Restaurant")
+        self.assertEqual(result["tenants"][0]["status"], "Trialing")
+        self.assertNotIn("api_secret", result["tenants"][0])
+        self.assertNotIn("customer_token", result["tenants"][0])
+
+    def test_operator_page_is_role_scoped_and_uses_guarded_lifecycle_apis(self):
+        app_root = Path(api.__file__).parent
+        page_root = (
+            app_root
+            / "flexipos"
+            / "page"
+            / "flexipos_saas_console"
+        )
+        manifest = json.loads(
+            (page_root / "flexipos_saas_console.json").read_text()
+        )
+        script = (page_root / "flexipos_saas_console.js").read_text()
+        settings_script = (
+            app_root / "public" / "js" / "flexipos_saas_settings.js"
+        ).read_text()
+
+        self.assertEqual(manifest["roles"], [{"role": "System Manager"}])
+        self.assertIn("flexipos.api.saas_list_tenants", script)
+        self.assertIn("flexipos.api.saas_extend_trial", script)
+        self.assertIn("flexipos.api.saas_set_tenant_status", script)
+        self.assertNotIn("secret_api_key", script)
+        self.assertNotIn("webhook_secret", script)
+        self.assertIn('frappe.set_route("flexipos-saas-console")', settings_script)
+
+
 class TestSubscriptionLifecycle(FrappeTestCase):
     def test_first_pin_starts_configured_trial_and_returns_fresh_status(self):
         fixed_now = frappe.utils.get_datetime("2026-07-22 12:00:00")
