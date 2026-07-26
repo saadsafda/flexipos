@@ -73,6 +73,7 @@ from frappe.utils import (
 
 DEFAULT_CURRENCY = "PKR"
 BUSINESS_TYPES = ["Restaurant", "Pharmacy", "Retail", "Service", "Clothing", "Bakery", "Other"]
+LAUNCH_BUSINESS_TYPES = {"Restaurant", "Retail"}
 DEFAULT_COUNTRY = "Pakistan"
 DEFAULT_PRICE_LIST = "Standard Selling"
 WALK_IN_CUSTOMER = "Walk-in Customer"
@@ -662,8 +663,7 @@ def register_business(business_name, business_type, phone=None, email=None):
     if not business_name:
         frappe.throw(_("Business name is required"))
     validate_email_address(email, throw=True)
-    if business_type not in BUSINESS_TYPES:
-        business_type = "Retail"
+    business_type = _validate_launch_business_type(business_type)
 
     _rate_limit_signup()
 
@@ -736,6 +736,7 @@ def setup_new_business(company_name, business_type=None, phone=None):
     company_name = (company_name or "").strip()
     if not company_name:
         frappe.throw(_("Business name is required"))
+    business_type = _validate_launch_business_type(business_type)
     _require_business_setup_access()
     if frappe.db.exists("Company", {"company_name": company_name}):
         frappe.throw(_("A business named {0} already exists").format(company_name))
@@ -752,6 +753,21 @@ def setup_new_business(company_name, business_type=None, phone=None):
             _("Could not set up the business. The error has been logged.")
         )
     return result
+
+
+def _validate_launch_business_type(business_type):
+    """Keep self-serve provisioning inside the supported Phase 4 scope."""
+    value = (business_type or "Retail").strip().title()
+    if value not in BUSINESS_TYPES:
+        frappe.throw(_("Unknown business type"))
+    if value not in LAUNCH_BUSINESS_TYPES:
+        frappe.throw(
+            _(
+                "{0} onboarding is not available yet. "
+                "Choose Retail or Restaurant."
+            ).format(value)
+        )
+    return value
 
 
 @frappe.whitelist()

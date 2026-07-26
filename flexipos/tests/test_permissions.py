@@ -89,6 +89,19 @@ class TestScreenPermissionGuards(FrappeTestCase):
             api._require_business_setup_access()
 
 
+class TestLaunchNicheScope(FrappeTestCase):
+    def test_retail_and_restaurant_can_be_provisioned(self):
+        self.assertEqual(api._validate_launch_business_type("retail"), "Retail")
+        self.assertEqual(
+            api._validate_launch_business_type("Restaurant"), "Restaurant"
+        )
+
+    def test_unfinished_niches_cannot_be_self_provisioned(self):
+        for value in ("Pharmacy", "Clothing", "Bakery", "Service", "Other"):
+            with self.subTest(value=value), self.assertRaises(frappe.ValidationError):
+                api._validate_launch_business_type(value)
+
+
 class TestSubscriptionLifecycle(FrappeTestCase):
     def test_first_pin_starts_configured_trial_and_returns_fresh_status(self):
         fixed_now = frappe.utils.get_datetime("2026-07-22 12:00:00")
