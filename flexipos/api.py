@@ -801,26 +801,45 @@ def _subscription_payload(company):
     trial_end = values.get(TRIAL_ENDS_FIELD)
     period_end = values.get(CURRENT_PERIOD_END_FIELD)
     saas_settings = _get_saas_settings()
-    require_billing_setup = cint(saas_settings.require_payment_method_on_signup)
+    payment_gateway_disabled = _payment_gateway_disabled(saas_settings)
+    require_billing_setup = (
+        not payment_gateway_disabled
+        and cint(saas_settings.require_payment_method_on_signup)
+    )
     has_payment_token = bool(frappe.db.get_value("Company", company, BILLING_CUSTOMER_FIELD))
-    if status == "Trialing" and trial_end and get_datetime(trial_end) <= now:
+    if (
+        not payment_gateway_disabled
+        and status == "Trialing"
+        and trial_end
+        and get_datetime(trial_end) <= now
+    ):
         status = "Past Due"
         frappe.db.set_value("Company", company, SUBSCRIPTION_STATUS_FIELD, status, update_modified=False)
-    elif status == "Active" and period_end and get_datetime(period_end) <= now:
+    elif (
+        not payment_gateway_disabled
+        and status == "Active"
+        and period_end
+        and get_datetime(period_end) <= now
+    ):
         status = "Past Due"
         frappe.db.set_value("Company", company, SUBSCRIPTION_STATUS_FIELD, status, update_modified=False)
     return {
         "status": status,
         "trial_ends_on": str(trial_end) if trial_end else None,
         "current_period_end": str(period_end) if period_end else None,
-        "billing_provider": values.get(BILLING_PROVIDER_FIELD)
-        or (saas_settings.billing_provider if saas_settings.billing_enabled else None),
+        "billing_provider": None
+        if payment_gateway_disabled
+        else (
+            values.get(BILLING_PROVIDER_FIELD)
+            or (saas_settings.billing_provider if saas_settings.billing_enabled else None)
+        ),
         "plan": values.get(BILLING_PLAN_FIELD) or None,
         "billing_email": values.get(BILLING_EMAIL_FIELD) or None,
         "deletion_requested_at": str(values.get(DELETION_REQUESTED_FIELD)) if values.get(DELETION_REQUESTED_FIELD) else None,
         "retention_until": str(values.get(RETENTION_UNTIL_FIELD)) if values.get(RETENTION_UNTIL_FIELD) else None,
         "trial_days": _default_trial_days(),
         "billing_setup_required": bool(require_billing_setup and not has_payment_token),
+        "payment_gateway_disabled": payment_gateway_disabled,
         "terms_url": saas_settings.terms_url or None,
         "privacy_url": saas_settings.privacy_url or None,
     }
@@ -843,6 +862,9 @@ def _get_saas_settings(include_secrets=False):
     only for server-side provider/webhook operations.
     """
     values = frappe._dict(
+        disable_payment_gateway=bool(
+            frappe.conf.get("flexipos_disable_payment_gateway")
+        ),
         billing_enabled=bool(frappe.conf.get("flexipos_billing_enabled")),
         billing_provider=frappe.conf.get("flexipos_billing_provider") or "Safepay",
         sandbox_mode=bool(frappe.conf.get("flexipos_billing_sandbox", True)),
@@ -878,6 +900,12 @@ def _get_saas_settings(include_secrets=False):
     return values
 
 
+def _payment_gateway_disabled(settings=None):
+    """Whether the operator has made FlexiPOS free for all active tenants."""
+    settings = settings or _get_saas_settings()
+    return bool(cint(settings.get("disable_payment_gateway")))
+
+
 def _default_deletion_retention_days():
     configured = cint(_get_saas_settings().deletion_retention_days)
     return max(1, min(configured or DEFAULT_RETENTION_DAYS, 3650))
@@ -886,7 +914,14 @@ def _default_deletion_retention_days():
 def _subscription_client_payload(company):
     """Stable flattened contract consumed by Flutter login/session flows."""
     value = _subscription_payload(company)
-    status_key = value["status"].lower().replace(" ", "_")
+    payment_gateway_disabled = bool(value.get("payment_gateway_disabled"))
+    effective_status = value["status"]
+    if (
+        payment_gateway_disabled
+        and effective_status not in {"Suspended", "Archived"}
+    ):
+        effective_status = "Active"
+    status_key = effective_status.lower().replace(" ", "_")
     tenant_status = "suspended" if value["status"] == "Suspended" else (
         "archived" if value["status"] == "Archived" else "active"
     )
@@ -897,7 +932,10 @@ def _subscription_client_payload(company):
         "trial_ends_at": value.get("trial_ends_on"),
         "subscription_ends_at": value.get("current_period_end"),
         "tenant_status": tenant_status,
-        "billing_setup_required": value.get("billing_setup_required", False),
+        "billing_setup_required": False
+        if payment_gateway_disabled
+        else value.get("billing_setup_required", False),
+        "payment_gateway_disabled": payment_gateway_disabled,
     }
 
 
@@ -909,6 +947,11 @@ def _require_subscription_access(company=None):
     """
     company = company or _get_user_company()
     subscription = _subscription_payload(company)
+    if (
+        subscription.get("payment_gateway_disabled")
+        and subscription["status"] not in {"Suspended", "Archived"}
+    ):
+        return subscription
     if subscription["status"] not in OPERATIONAL_SUBSCRIPTION_STATUSES:
         frappe.throw(
             _("This business subscription is {0}. Update billing to continue.").format(subscription["status"]),
@@ -1077,7 +1120,11 @@ def saas_set_tenant_status(company, status, current_period_end=None, reason=None
         if period_end <= now_datetime():
             frappe.throw(_("The subscription period end must be in the future"))
         values[CURRENT_PERIOD_END_FIELD] = period_end
-    elif status == "Active" and not frappe.db.get_value("Company", company, CURRENT_PERIOD_END_FIELD):
+    elif (
+        status == "Active"
+        and not _payment_gateway_disabled()
+        and not frappe.db.get_value("Company", company, CURRENT_PERIOD_END_FIELD)
+    ):
         frappe.throw(_("An active tenant needs a future subscription period end"))
     frappe.db.set_value("Company", company, values, update_modified=False)
     _audit_saas_action("tenant status changed", company, {"status": status, "reason": (reason or "")[:240]})
@@ -1101,6 +1148,8 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
             frappe.PermissionError,
         )
     settings = _get_saas_settings(include_secrets=True)
+    if _payment_gateway_disabled(settings):
+        frappe.throw(_("Payments are disabled because free access is enabled"))
     if not cint(settings.billing_enabled):
         frappe.throw(_("Billing is not enabled by the SaaS operator"))
     configured_provider = (settings.billing_provider or "safepay").strip().lower()
@@ -1331,7 +1380,11 @@ def admin_set_subscription(status, current_period_end=None, plan=None):
     if status not in SUBSCRIPTION_STATUSES:
         frappe.throw(_("Invalid subscription status"))
     period_end = get_datetime(current_period_end) if current_period_end else None
-    if status == "Active" and (not period_end or period_end <= now_datetime()):
+    if (
+        status == "Active"
+        and not _payment_gateway_disabled()
+        and (not period_end or period_end <= now_datetime())
+    ):
         frappe.throw(_("An active subscription needs a future period end"))
     values = {SUBSCRIPTION_STATUS_FIELD: status}
     if period_end:
@@ -1372,6 +1425,8 @@ def billing_webhook(provider, event_id, event_type, company, status, signature, 
     store opaque customer tokens; raw card data is rejected by design.
     """
     settings = _get_saas_settings(include_secrets=True)
+    if _payment_gateway_disabled(settings):
+        frappe.throw(_("Payments are disabled because free access is enabled"), frappe.PermissionError)
     if not cint(settings.billing_enabled):
         frappe.throw(_("Billing is not enabled"), frappe.PermissionError)
     configured_provider = (settings.billing_provider or "").strip().lower()
@@ -1511,6 +1566,8 @@ def safepay_webhook():
     the provider—is resolved against our server-created checkout record.
     """
     settings = _get_saas_settings(include_secrets=True)
+    if _payment_gateway_disabled(settings):
+        frappe.throw(_("Payments are disabled because free access is enabled"), frappe.PermissionError)
     if not cint(settings.billing_enabled) or (
         settings.billing_provider or ""
     ).strip().lower() != "safepay":
@@ -1900,6 +1957,7 @@ def _make_abbr(company_name):
 
 
 def _create_company(company_name, business_type, phone):
+    payment_gateway_disabled = _payment_gateway_disabled()
     company = frappe.get_doc(
         {
             "doctype": "Company",
@@ -1914,8 +1972,14 @@ def _create_company(company_name, business_type, phone):
             CATEGORY_NAMES_FIELD: "[]",
             DEFAULT_TAX_RATE_FIELD: 0,
             SERVICE_STYLES_FIELD: "Dine-in,Takeaway" if business_type == "Restaurant" else "",
-            SUBSCRIPTION_STATUS_FIELD: "Trialing",
-            TRIAL_ENDS_FIELD: add_to_date(now_datetime(), days=_default_trial_days()),
+            SUBSCRIPTION_STATUS_FIELD: (
+                "Active" if payment_gateway_disabled else "Trialing"
+            ),
+            TRIAL_ENDS_FIELD: (
+                None
+                if payment_gateway_disabled
+                else add_to_date(now_datetime(), days=_default_trial_days())
+            ),
             BILLING_EMAIL_FIELD: frappe.session.user if "@" in (frappe.session.user or "") else "",
             "enable_perpetual_inventory": 0,
         }
@@ -5512,6 +5576,7 @@ def register_device_pin(pin, device_id):
         not existing_pin
         and status in ("Trialing", "Past Due")
         and _is_company_owner(user, company)
+        and not _payment_gateway_disabled()
     ):
         frappe.db.set_value(
             "Company",

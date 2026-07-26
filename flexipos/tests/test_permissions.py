@@ -106,6 +106,7 @@ class TestSubscriptionLifecycle(FrappeTestCase):
             patch.object(frappe.db, "set_value") as set_value,
             patch.object(api, "_get_user_company", return_value="Company A"),
             patch.object(api, "_is_company_owner", return_value=True),
+            patch.object(api, "_payment_gateway_disabled", return_value=False),
             patch.object(api, "_default_trial_days", return_value=30),
             patch.object(api, "now_datetime", return_value=fixed_now),
             patch.object(
@@ -212,6 +213,35 @@ class TestSubscriptionLifecycle(FrappeTestCase):
             with self.assertRaises(frappe.PermissionError):
                 api._require_subscription_access()
 
+    def test_free_access_bypasses_payment_status_but_not_suspension(self):
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(
+                api,
+                "_subscription_payload",
+                return_value={
+                    "status": "Past Due",
+                    "payment_gateway_disabled": True,
+                },
+            ),
+        ):
+            subscription = api._require_subscription_access()
+        self.assertEqual(subscription["status"], "Past Due")
+
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(
+                api,
+                "_subscription_payload",
+                return_value={
+                    "status": "Suspended",
+                    "payment_gateway_disabled": True,
+                },
+            ),
+        ):
+            with self.assertRaises(frappe.PermissionError):
+                api._require_subscription_access()
+
     def test_client_payload_is_normalized_for_flutter(self):
         with patch.object(
             api,
@@ -228,6 +258,60 @@ class TestSubscriptionLifecycle(FrappeTestCase):
             payload = api._subscription_client_payload("Company A")
         self.assertEqual(payload["subscription_status"], "past_due")
         self.assertTrue(payload["billing_setup_required"])
+
+    def test_free_access_is_active_for_flutter_and_never_requires_billing(self):
+        with patch.object(
+            api,
+            "_subscription_payload",
+            return_value={
+                "status": "Past Due",
+                "plan": "monthly",
+                "billing_provider": None,
+                "trial_ends_on": None,
+                "current_period_end": None,
+                "billing_setup_required": True,
+                "payment_gateway_disabled": True,
+            },
+        ):
+            payload = api._subscription_client_payload("Company A")
+        self.assertEqual(payload["subscription_status"], "active")
+        self.assertFalse(payload["billing_setup_required"])
+        self.assertTrue(payload["payment_gateway_disabled"])
+
+    def test_free_access_does_not_expire_an_existing_trial(self):
+        values = frappe._dict(
+            flexipos_subscription_status="Trialing",
+            flexipos_trial_ends_on=frappe.utils.add_to_date(
+                frappe.utils.now_datetime(), days=-1
+            ),
+            flexipos_current_period_end=None,
+            flexipos_billing_provider=None,
+            flexipos_billing_plan=None,
+            flexipos_billing_email=None,
+            flexipos_deletion_requested_at=None,
+            flexipos_retention_until=None,
+        )
+        with (
+            patch.object(frappe.db, "get_value", return_value=values),
+            patch.object(frappe.db, "set_value") as set_value,
+            patch.object(
+                api,
+                "_get_saas_settings",
+                return_value=frappe._dict(
+                    disable_payment_gateway=1,
+                    require_payment_method_on_signup=1,
+                    billing_enabled=1,
+                    billing_provider="Safepay",
+                    terms_url=None,
+                    privacy_url=None,
+                ),
+            ),
+        ):
+            subscription = api._subscription_payload("Company A")
+        self.assertEqual(subscription["status"], "Trialing")
+        self.assertTrue(subscription["payment_gateway_disabled"])
+        self.assertFalse(subscription["billing_setup_required"])
+        set_value.assert_not_called()
 
     def test_cross_tenant_controls_require_site_administrator(self):
         previous = frappe.session.user

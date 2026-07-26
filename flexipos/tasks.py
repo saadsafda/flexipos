@@ -22,6 +22,7 @@ from flexipos.api import (
     RETENTION_UNTIL_FIELD,
     SUBSCRIPTION_STATUS_FIELD,
     TRIAL_ENDS_FIELD,
+    _payment_gateway_disabled,
 )
 
 
@@ -32,6 +33,8 @@ def run_subscription_lifecycle():
 
 
 def _expire_subscriptions():
+    if _payment_gateway_disabled():
+        return
     now = now_datetime()
     for row in frappe.get_all(
         "Company",
@@ -97,4 +100,3 @@ def _anonymise_tenant(company):
         },
         update_modified=False,
     )
-
