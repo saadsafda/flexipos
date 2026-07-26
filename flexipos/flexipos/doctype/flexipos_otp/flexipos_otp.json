@@ -23,7 +23,7 @@
    "reqd": 1
   },
   {
-   "description": "Stored in plain text until SMTP/WhatsApp delivery is configured, so the code can be read from this list and relayed manually.",
+   "description": "Emailed to the user on request. Stored in plain text so it can also be read from this list and relayed manually if email delivery fails.",
    "fieldname": "otp",
    "fieldtype": "Data",
    "in_list_view": 1,

@@ -65,6 +65,7 @@ from frappe import _
 from frappe.utils import (
     add_to_date,
     cint,
+    escape_html,
     flt,
     get_datetime,
     now_datetime,
@@ -6511,15 +6512,13 @@ def _require_staff_of_company(user, company):
 # 5. OTP login (existing account on a new device)
 # ---------------------------------------------------------------------------
 # Accounts are password-less, so a new device authenticates with a
-# one-time code. Delivery (SMTP / WhatsApp gateway) is not wired yet:
-# the code is stored in the "FlexiPOS OTP" DocType, readable from the
-# desk by an administrator who relays it manually. Once a gateway is
-# configured, plug delivery into request_login_otp and switch the `otp`
-# field to a hash.
+# one-time code. The code is stored in the "FlexiPOS OTP" DocType and
+# emailed to the account via frappe.sendmail (requires a default outgoing
+# Email Account to be configured on the site).
 
 @frappe.whitelist(allow_guest=True)
 def request_login_otp(email, device_id):
-    """Create a 6-digit login code for an existing account."""
+    """Create a 6-digit login code for an existing account and email it."""
     email = (email or "").strip().lower()
     device_id = (device_id or "").strip()
     validate_email_address(email, throw=True)
@@ -6549,8 +6548,33 @@ def request_login_otp(email, device_id):
         }
     ).insert(ignore_permissions=True)
 
-    # TODO: deliver via SMTP / WhatsApp gateway when configured.
+    _send_otp_email(email, otp)
     return {"requested": True, "expires_in_seconds": OTP_TTL_SECONDS}
+
+
+def _send_otp_email(email, otp):
+    """Email the login code to the account. Failures are logged, not raised,
+    so the OTP record still exists for a manual desk-side relay if SMTP is
+    down or misconfigured."""
+    minutes = OTP_TTL_SECONDS // 60
+    message = (
+        f"<p>{escape_html(_('Your FlexiPOS login code is:'))}</p>"
+        f"<p style='font-size:24px;font-weight:bold;letter-spacing:4px;'>"
+        f"{escape_html(otp)}</p>"
+        f"<p>{escape_html(_('This code expires in {0} minutes.').format(minutes))}</p>"
+        f"<p>{escape_html(_('If you did not request this, you can ignore this email.'))}</p>"
+    )
+    try:
+        frappe.sendmail(
+            recipients=[email],
+            subject=_("Your FlexiPOS login code"),
+            message=message,
+            now=True,
+        )
+    except Exception:
+        frappe.log_error(
+            frappe.get_traceback(), f"FlexiPOS OTP email failed: {email}"
+        )
 
 
 @frappe.whitelist(allow_guest=True)
