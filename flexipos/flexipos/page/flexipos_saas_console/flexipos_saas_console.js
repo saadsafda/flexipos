@@ -16,11 +16,30 @@ class FlexiPOSSaaSConsole {
 		this.page = page;
 		this.wrapper = wrapper;
 		this.tenants = [];
+		this.operations = {};
 		this.filters = { search: "", status: "" };
 
 		this.page.set_primary_action(__("Refresh"), () => this.refresh(), "refresh");
 		this.page.add_menu_item(__("SaaS Settings"), () => {
 			frappe.set_route("Form", "FlexiPOS SaaS Settings", "FlexiPOS SaaS Settings");
+		});
+		this.page.add_menu_item(__("Billing notices"), () => {
+			frappe.set_route("List", "FlexiPOS Billing Notice");
+		});
+		this.page.add_menu_item(__("Billing invoices"), () => {
+			frappe.set_route("List", "FlexiPOS Billing Invoice");
+		});
+		this.page.add_menu_item(__("Support tickets"), () => {
+			frappe.set_route("List", "FlexiPOS Support Ticket");
+		});
+		this.page.add_menu_item(__("Knowledge base"), () => {
+			frappe.set_route("List", "FlexiPOS Knowledge Article");
+		});
+		this.page.add_menu_item(__("Service status"), () => {
+			frappe.set_route("List", "FlexiPOS Service Component");
+		});
+		this.page.add_menu_item(__("Policy acceptances"), () => {
+			frappe.set_route("List", "FlexiPOS Policy Acceptance");
 		});
 		this.page.add_menu_item(__("Change default trial"), () => this.change_default_trial());
 		this.make();
@@ -83,11 +102,17 @@ class FlexiPOSSaaSConsole {
 		this.page.set_indicator(__("Loading"), "orange");
 		this.content.html(`<div class="saas-loading">${__("Loading tenants…")}</div>`);
 		try {
-			const response = await frappe.call({
-				method: "flexipos.api.saas_list_tenants",
-				args: { limit: 500, start: 0 },
-			});
+			const [response, operations] = await Promise.all([
+				frappe.call({
+					method: "flexipos.api.saas_list_tenants",
+					args: { limit: 500, start: 0 },
+				}),
+				frappe.call({
+					method: "flexipos.api.saas_operations_dashboard",
+				}),
+			]);
 			this.tenants = response.message?.tenants || [];
+			this.operations = operations.message || {};
 			this.default_trial_days = response.message?.default_trial_days ?? 0;
 			this.render();
 			this.page.set_indicator(__("Live"), "green");
@@ -155,12 +180,23 @@ class FlexiPOSSaaSConsole {
 
 	render_summary() {
 		const count = (status) => this.tenants.filter((tenant) => tenant.status === status).length;
+		const product = this.operations.product || {};
+		const operations = this.operations.operations || {};
+		const tenant_metrics = this.operations.tenants || {};
+		const readiness = this.operations.launch_readiness || {};
 		const cards = [
 			[__("Total tenants"), this.tenants.length, "blue"],
 			[__("Active"), count("Active"), "green"],
 			[__("Trialing"), count("Trialing"), "orange"],
 			[__("Needs attention"), count("Past Due") + count("Suspended"), "red"],
 			[__("Default trial"), __("{0} days", [this.default_trial_days]), "gray"],
+			[__("Paid conversion"), `${tenant_metrics.conversion_percent || 0}%`, "green"],
+			[__("Selling tenants · 30d"), product.selling_tenants_30d || 0, "blue"],
+			[__("Completed sales · 30d"), product.completed_sales_30d || 0, "blue"],
+			[__("Open support"), operations.open_support_tickets || 0, operations.urgent_support_tickets ? "red" : "gray"],
+			[__("Failed billing emails"), operations.failed_billing_emails || 0, operations.failed_billing_emails ? "red" : "green"],
+			[__("Legal review"), readiness.legal_review_status || __("Pending"), readiness.legal_review_status === "Approved" ? "green" : "orange"],
+			[__("Tax review"), readiness.tax_review_status || __("Pending"), readiness.tax_review_status === "Approved" ? "green" : "orange"],
 		];
 		this.summary.empty();
 		cards.forEach(([label, value, color]) => {
@@ -198,6 +234,13 @@ class FlexiPOSSaaSConsole {
 		$("<td></td>").text(tenant.billing_email || __("Not configured")).appendTo(row);
 
 		const actions = $("<td class='text-right saas-row-actions'></td>").appendTo(row);
+		$("<button class='btn btn-xs btn-default'></button>")
+			.text(__("Invoices"))
+			.on("click", () => {
+				frappe.route_options = { company: tenant.company };
+				frappe.set_route("List", "FlexiPOS Billing Invoice");
+			})
+			.appendTo(actions);
 		$("<button class='btn btn-xs btn-default'></button>")
 			.text(__("Extend trial"))
 			.on("click", () => this.extend_trial(tenant))

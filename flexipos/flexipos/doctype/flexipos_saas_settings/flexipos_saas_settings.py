@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint
+from frappe.utils import cint, validate_email_address
 
 
 class FlexiPOSSaaSSettings(Document):
@@ -37,6 +37,37 @@ class FlexiPOSSaaSSettings(Document):
             parsed = urlparse(self.checkout_url.strip())
             if parsed.scheme not in ({"http", "https"} if self.sandbox_mode else {"https"}):
                 frappe.throw(_("Production checkout URL must use HTTPS"))
+        if self.billing_portal_url:
+            parsed = urlparse(self.billing_portal_url.strip())
+            if parsed.scheme != "https" or not parsed.netloc:
+                frappe.throw(_("Customer billing portal URL must use HTTPS"))
+        if self.billing_support_email:
+            validate_email_address(self.billing_support_email, throw=True)
+        for fieldname in ("terms_url", "privacy_url", "retention_policy_url"):
+            value = (self.get(fieldname) or "").strip()
+            parsed = urlparse(value)
+            if value and (parsed.scheme != "https" or not parsed.netloc):
+                frappe.throw(
+                    _("{0} must use a valid HTTPS URL").format(
+                        self.meta.get_label(fieldname)
+                    )
+                )
+        if self.legal_review_status == "Approved" and not (
+            self.legal_reviewer and self.legal_reviewed_on
+        ):
+            frappe.throw(
+                _("Approved legal review requires a reviewer and review date")
+            )
+        if self.tax_review_status == "Approved" and not (
+            self.tax_reviewer
+            and self.tax_reviewed_on
+            and (self.tax_jurisdictions or "").strip()
+        ):
+            frappe.throw(
+                _(
+                    "Approved tax review requires a reviewer, review date and jurisdictions"
+                )
+            )
 
         if (
             not self.disable_payment_gateway

@@ -215,6 +215,11 @@ DEFAULT_TRIAL_DAYS_KEY = "flexipos_default_trial_days"
 MAX_TRIAL_EXTENSION_DAYS = 365
 SAAS_SETTINGS_DOCTYPE = "FlexiPOS SaaS Settings"
 BILLING_CHECKOUT_DOCTYPE = "FlexiPOS Billing Checkout"
+BILLING_INVOICE_DOCTYPE = "FlexiPOS Billing Invoice"
+SUPPORT_TICKET_DOCTYPE = "FlexiPOS Support Ticket"
+KNOWLEDGE_ARTICLE_DOCTYPE = "FlexiPOS Knowledge Article"
+SERVICE_COMPONENT_DOCTYPE = "FlexiPOS Service Component"
+POLICY_ACCEPTANCE_DOCTYPE = "FlexiPOS Policy Acceptance"
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +653,18 @@ def _ensure_custom_fields():
 # 1. setup_new_business
 # ---------------------------------------------------------------------------
 
+
+@frappe.whitelist(allow_guest=True)
+def health():
+    """Minimal deployment probe with no tenant or credential information."""
+    return {
+        "ok": True,
+        "service": "Sprout POS / FlexiPOS",
+        "server_time": str(now_datetime()),
+        "offline_pos_supported": True,
+    }
+
+
 @frappe.whitelist(allow_guest=True)
 def register_business(business_name, business_type, phone=None, email=None):
     """Self-serve signup used by the app's onboarding screen.
@@ -858,6 +875,14 @@ def _subscription_payload(company):
         "payment_gateway_disabled": payment_gateway_disabled,
         "terms_url": saas_settings.terms_url or None,
         "privacy_url": saas_settings.privacy_url or None,
+        "retention_policy_url": (
+            getattr(saas_settings, "retention_policy_url", None) or None
+        ),
+        "terms_version": getattr(saas_settings, "terms_version", "draft"),
+        "privacy_version": getattr(saas_settings, "privacy_version", "draft"),
+        "retention_policy_version": getattr(
+            saas_settings, "retention_policy_version", "draft"
+        ),
     }
 
 
@@ -892,10 +917,19 @@ def _get_saas_settings(include_secrets=False):
         default_plan="monthly",
         monthly_plan_id=None,
         annual_plan_id=None,
+        billing_email_enabled=True,
+        billing_support_email=None,
+        billing_portal_url=None,
         default_trial_days=frappe.db.get_default(DEFAULT_TRIAL_DAYS_KEY),
         deletion_retention_days=DEFAULT_RETENTION_DAYS,
         terms_url=None,
         privacy_url=None,
+        terms_version="draft",
+        privacy_version="draft",
+        retention_policy_url=None,
+        retention_policy_version="draft",
+        legal_review_status="Pending",
+        tax_review_status="Pending",
     )
     if frappe.db.exists("DocType", SAAS_SETTINGS_DOCTYPE):
         doc = frappe.get_single(SAAS_SETTINGS_DOCTYPE)
@@ -1062,6 +1096,113 @@ def saas_list_tenants(limit=200, start=0):
 
 
 @frappe.whitelist()
+def saas_operations_dashboard():
+    """Return aggregate, privacy-minimised launch metrics for operators."""
+    _require_saas_operator()
+    now = now_datetime()
+    since_30d = add_to_date(now, days=-30)
+    since_24h = add_to_date(now, hours=-24)
+    settings = _get_saas_settings()
+
+    def count(doctype, filters=None):
+        if doctype != "Company" and not frappe.db.exists("DocType", doctype):
+            return 0
+        return frappe.db.count(doctype, filters=filters or {})
+
+    tenants = {
+        status: count("Company", {SUBSCRIPTION_STATUS_FIELD: status})
+        for status in ("Trialing", "Active", "Past Due", "Cancelled", "Suspended")
+    }
+    total_tenants = count("Company")
+    conversion_base = (
+        tenants["Active"] + tenants["Past Due"] + tenants["Cancelled"]
+    )
+    completed_sales_30d = count(
+        "Sales Invoice",
+        {"docstatus": 1, "posting_date": (">=", since_30d.date())},
+    )
+    active_selling_tenants = len(
+        frappe.get_all(
+            "Sales Invoice",
+            filters={"docstatus": 1, "posting_date": (">=", since_30d.date())},
+            pluck="company",
+            group_by="company",
+            limit_page_length=0,
+        )
+    )
+    return {
+        "generated_at": str(now),
+        "tenants": {
+            "total": total_tenants,
+            **{frappe.scrub(key): value for key, value in tenants.items()},
+            "new_30d": count("Company", {"creation": (">=", since_30d)}),
+            "conversion_percent": round(
+                (tenants["Active"] / conversion_base * 100)
+                if conversion_base
+                else 0,
+                1,
+            ),
+        },
+        "product": {
+            "completed_sales_30d": completed_sales_30d,
+            "selling_tenants_30d": active_selling_tenants,
+            "billing_invoices_30d": count(
+                BILLING_INVOICE_DOCTYPE, {"issued_at": (">=", since_30d)}
+            ),
+            "support_tickets_30d": count(
+                SUPPORT_TICKET_DOCTYPE, {"opened_at": (">=", since_30d)}
+            ),
+        },
+        "operations": {
+            "open_support_tickets": count(
+                SUPPORT_TICKET_DOCTYPE,
+                {"status": ("in", ["Open", "In Progress", "Waiting on Customer"])},
+            ),
+            "urgent_support_tickets": count(
+                SUPPORT_TICKET_DOCTYPE,
+                {
+                    "priority": "Urgent",
+                    "status": ("not in", ["Resolved", "Closed"]),
+                },
+            ),
+            "failed_billing_emails": count(
+                "FlexiPOS Billing Notice", {"status": "Failed"}
+            ),
+            "service_incidents": count(
+                SERVICE_COMPONENT_DOCTYPE,
+                {"status": ("not in", ["Operational"])},
+            ),
+            "sales_last_24h": count(
+                "Sales Invoice",
+                {"docstatus": 1, "creation": (">=", since_24h)},
+            ),
+        },
+        "launch_readiness": {
+            "policy_links_configured": all(
+                getattr(settings, fieldname, None)
+                for fieldname in (
+                    "terms_url",
+                    "privacy_url",
+                    "retention_policy_url",
+                )
+            ),
+            "policy_versions_final": all(
+                str(getattr(settings, fieldname, "draft")).lower() != "draft"
+                for fieldname in (
+                    "terms_version",
+                    "privacy_version",
+                    "retention_policy_version",
+                )
+            ),
+            "legal_review_status": getattr(
+                settings, "legal_review_status", "Pending"
+            ),
+            "tax_review_status": getattr(settings, "tax_review_status", "Pending"),
+        },
+    }
+
+
+@frappe.whitelist()
 def saas_set_default_trial_days(days):
     """Change the default trial length for businesses created afterwards."""
     _require_saas_operator()
@@ -1156,6 +1297,62 @@ def saas_set_tenant_status(company, status, current_period_end=None, reason=None
     return {"company": company, "subscription": _subscription_payload(company)}
 
 
+def _require_production_launch_readiness(settings):
+    """Fail closed before real recurring billing until reviews are recorded."""
+    if cint(getattr(settings, "sandbox_mode", 1)):
+        return
+    required_links = (
+        getattr(settings, "terms_url", None),
+        getattr(settings, "privacy_url", None),
+        getattr(settings, "retention_policy_url", None),
+    )
+    versions = (
+        getattr(settings, "terms_version", "draft"),
+        getattr(settings, "privacy_version", "draft"),
+        getattr(settings, "retention_policy_version", "draft"),
+    )
+    if not all(required_links) or any(
+        str(version or "draft").lower() == "draft" for version in versions
+    ):
+        frappe.throw(
+            _("Publish versioned terms, privacy and retention policies first")
+        )
+    if (
+        getattr(settings, "legal_review_status", "Pending") != "Approved"
+        or getattr(settings, "tax_review_status", "Pending") != "Approved"
+    ):
+        frappe.throw(
+            _("Legal and tax reviews must be approved before production billing")
+        )
+
+
+def _record_policy_acceptance(company, purpose, settings):
+    if not frappe.db.exists("DocType", POLICY_ACCEPTANCE_DOCTYPE):
+        return None
+    terms_version = str(getattr(settings, "terms_version", "draft"))[:80]
+    privacy_version = str(getattr(settings, "privacy_version", "draft"))[:80]
+    raw = (
+        f"{company}\0{frappe.session.user}\0{purpose}\0"
+        f"{terms_version}\0{privacy_version}"
+    )
+    acceptance_id = hashlib.sha256(raw.encode()).hexdigest()
+    if frappe.db.exists(POLICY_ACCEPTANCE_DOCTYPE, acceptance_id):
+        return acceptance_id
+    frappe.get_doc(
+        {
+            "doctype": POLICY_ACCEPTANCE_DOCTYPE,
+            "acceptance_id": acceptance_id,
+            "company": company,
+            "user": frappe.session.user,
+            "purpose": str(purpose)[:80],
+            "terms_version": terms_version,
+            "privacy_version": privacy_version,
+            "accepted_at": now_datetime(),
+        }
+    ).insert(ignore_permissions=True)
+    return acceptance_id
+
+
 @frappe.whitelist()
 def start_billing_checkout(plan, provider=None, billing_email=None, customer_token=None, privacy_consent=False):
     """Create a provider-hosted subscription checkout.
@@ -1189,6 +1386,7 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
         validate_email_address(billing_email, throw=True)
     if not cint(privacy_consent):
         frappe.throw(_("Privacy consent is required before billing"))
+    _require_production_launch_readiness(settings)
     frappe.db.set_value(
         "Company", company,
         {
@@ -1201,6 +1399,7 @@ def start_billing_checkout(plan, provider=None, billing_email=None, customer_tok
         },
         update_modified=False,
     )
+    _record_policy_acceptance(company, "Billing checkout", settings)
     if provider != "safepay":
         if provider == "custom" and settings.checkout_url:
             return {
@@ -1441,6 +1640,98 @@ def _contains_raw_card_data(value):
     return False
 
 
+def _record_billing_invoice(company, provider, event_id, payload, plan=None, status=None):
+    """Persist safe provider invoice metadata from a verified webhook."""
+    if not frappe.db.exists("DocType", BILLING_INVOICE_DOCTYPE):
+        return None
+    invoice_id = _find_billing_value(
+        payload,
+        {"invoice_id", "invoice_number", "billing_invoice_id", "receipt_id"},
+    )
+    if invoice_id in (None, ""):
+        return None
+    invoice_id = str(invoice_id).strip()[:140]
+    if not invoice_id:
+        return None
+
+    raw_minor = _find_billing_value(
+        payload, {"amount_minor", "total_minor", "paid_amount_minor"}
+    )
+    if raw_minor in (None, ""):
+        raw_amount = _find_billing_value(payload, {"amount", "total", "paid_amount"})
+        raw_minor = _money_minor(raw_amount) if raw_amount not in (None, "") else 0
+    try:
+        amount_minor = max(0, int(raw_minor))
+    except (TypeError, ValueError):
+        amount_minor = 0
+
+    values = {
+        "company": company,
+        "provider": str(provider or "").strip().lower()[:80],
+        "plan": str(
+            plan
+            or _find_billing_value(payload, {"plan", "plan_id"})
+            or ""
+        )[:80],
+        "status": str(
+            _find_billing_value(payload, {"invoice_status", "payment_status"})
+            or status
+            or "Issued"
+        )[:80],
+        "currency": str(
+            _find_billing_value(payload, {"currency", "currency_code"})
+            or DEFAULT_CURRENCY
+        ).upper()[:10],
+        "amount_minor": amount_minor,
+        "period_start": _find_billing_value(
+            payload, {"period_start", "current_period_start"}
+        ),
+        "period_end": _find_billing_value(
+            payload, {"period_end", "current_period_end"}
+        ),
+        "issued_at": _find_billing_value(
+            payload, {"issued_at", "created_at", "invoice_date"}
+        ) or now_datetime(),
+        "hosted_url": str(
+            _find_billing_value(
+                payload, {"hosted_invoice_url", "invoice_url", "receipt_url"}
+            )
+            or ""
+        )[:500],
+        "pdf_url": str(
+            _find_billing_value(payload, {"invoice_pdf", "pdf_url"})
+            or ""
+        )[:500],
+        "event_id": event_id,
+    }
+    if frappe.db.exists(BILLING_INVOICE_DOCTYPE, invoice_id):
+        frappe.db.set_value(
+            BILLING_INVOICE_DOCTYPE, invoice_id, values, update_modified=False
+        )
+    else:
+        frappe.get_doc(
+            {
+                "doctype": BILLING_INVOICE_DOCTYPE,
+                "invoice_id": invoice_id,
+                **values,
+            }
+        ).insert(ignore_permissions=True)
+    return invoice_id
+
+
+def _queue_billing_status_notice(company, status, event_id):
+    """Create one email job per verified event/status transition."""
+    from flexipos.tasks import queue_billing_notice
+
+    kind = {
+        "Active": "payment_succeeded",
+        "Past Due": "payment_failed",
+        "Cancelled": "subscription_cancelled",
+    }.get(status)
+    if kind:
+        queue_billing_notice(company, kind, event_id=event_id)
+
+
 @frappe.whitelist(allow_guest=True)
 def billing_webhook(provider, event_id, event_type, company, status, signature, payload_json="{}"):
     """Consume an idempotent, HMAC-signed gateway event.
@@ -1532,6 +1823,10 @@ def billing_webhook(provider, event_id, event_type, company, status, signature, 
             }
         ).insert(ignore_permissions=True)
     frappe.db.set_value("Company", company, values, update_modified=False)
+    _record_billing_invoice(
+        company, provider, event_id, payload, status=status
+    )
+    _queue_billing_status_notice(company, status, event_id)
     return {"ok": True, "duplicate": False, "company": company, "status": status}
 
 
@@ -1730,11 +2025,161 @@ def safepay_webhook():
         },
         update_modified=False,
     )
+    _record_billing_invoice(
+        company,
+        "safepay",
+        event_id,
+        data,
+        plan=checkout.plan,
+        status=status,
+    )
+    _queue_billing_status_notice(company, status, event_id)
     return {
         "ok": True,
         "duplicate": False,
         "company": company,
         "status": status,
+    }
+
+
+@frappe.whitelist()
+def get_billing_invoices(limit=100, start=0):
+    """Return safe invoice links belonging only to the current tenant."""
+    company = _get_user_company()
+    _require_admin(company)
+    limit = max(1, min(cint(limit), 200))
+    start = max(0, cint(start))
+    if not frappe.db.exists("DocType", BILLING_INVOICE_DOCTYPE):
+        return {"company": company, "invoices": [], "start": start, "limit": limit}
+    rows = frappe.get_all(
+        BILLING_INVOICE_DOCTYPE,
+        filters={"company": company},
+        fields=[
+            "invoice_id", "provider", "plan", "status", "currency",
+            "amount_minor", "period_start", "period_end", "issued_at",
+            "hosted_url", "pdf_url",
+        ],
+        order_by="issued_at desc",
+        limit_start=start,
+        limit_page_length=limit,
+    )
+    return {
+        "company": company,
+        "invoices": [dict(row) for row in rows],
+        "start": start,
+        "limit": limit,
+    }
+
+
+@frappe.whitelist()
+def sync_support(tickets_json="[]"):
+    """Sync offline support requests and return tenant-safe help content.
+
+    This endpoint intentionally remains available when billing is blocked so
+    customers can still contact support and read outage guidance.
+    """
+    company = _get_user_company()
+    incoming = _json_list(tickets_json, "support tickets")
+    if len(incoming) > 25:
+        frappe.throw(_("Send at most 25 support tickets at a time"))
+    results = []
+    if frappe.db.exists("DocType", SUPPORT_TICKET_DOCTYPE):
+        for raw in incoming:
+            if not isinstance(raw, dict):
+                frappe.throw(_("Each support ticket must be an object"))
+            ticket_id = str(raw.get("id") or "").strip()[:140]
+            subject = str(raw.get("subject") or "").strip()[:140]
+            description = str(raw.get("description") or "").strip()[:4000]
+            category = str(raw.get("category") or "General").strip().title()
+            priority = str(raw.get("priority") or "Normal").strip().title()
+            if not ticket_id or not subject or not description:
+                frappe.throw(
+                    _("Support ticket id, subject and description are required")
+                )
+            if category not in {
+                "General", "Billing", "Sales", "Inventory",
+                "Restaurant", "Hardware", "Account",
+            }:
+                category = "General"
+            if priority not in {"Low", "Normal", "High", "Urgent"}:
+                priority = "Normal"
+            if frappe.db.exists(SUPPORT_TICKET_DOCTYPE, ticket_id):
+                owner = frappe.db.get_value(
+                    SUPPORT_TICKET_DOCTYPE, ticket_id, "company"
+                )
+                if owner != company:
+                    frappe.throw(
+                        _("Support ticket belongs to another business"),
+                        frappe.PermissionError,
+                    )
+            else:
+                frappe.get_doc(
+                    {
+                        "doctype": SUPPORT_TICKET_DOCTYPE,
+                        "ticket_id": ticket_id,
+                        "company": company,
+                        "submitted_by": frappe.session.user,
+                        "subject": subject,
+                        "category": category,
+                        "priority": priority,
+                        "description": description,
+                        "status": "Open",
+                        "opened_at": now_datetime(),
+                    }
+                ).insert(ignore_permissions=True)
+            results.append({"id": ticket_id, "status": "success"})
+
+    ticket_filters = {"company": company}
+    if _effective_role(frappe.session.user) != ADMIN_ROLE:
+        ticket_filters["submitted_by"] = frappe.session.user
+    tickets = (
+        frappe.get_all(
+            SUPPORT_TICKET_DOCTYPE,
+            filters=ticket_filters,
+            fields=[
+                "ticket_id as id", "subject", "category", "priority",
+                "description", "status", "resolution", "opened_at",
+                "closed_at",
+            ],
+            order_by="opened_at desc",
+            limit_page_length=100,
+        )
+        if frappe.db.exists("DocType", SUPPORT_TICKET_DOCTYPE)
+        else []
+    )
+    articles = (
+        frappe.get_all(
+            KNOWLEDGE_ARTICLE_DOCTYPE,
+            filters={"published": 1},
+            fields=[
+                "article_key as id", "title", "summary", "body", "category",
+            ],
+            order_by="sort_order asc, title asc",
+            limit_page_length=200,
+        )
+        if frappe.db.exists("DocType", KNOWLEDGE_ARTICLE_DOCTYPE)
+        else []
+    )
+    components = (
+        frappe.get_all(
+            SERVICE_COMPONENT_DOCTYPE,
+            fields=[
+                "component_key as id", "label", "status", "message",
+                "updated_at",
+            ],
+            order_by="sort_order asc, label asc",
+            limit_page_length=100,
+        )
+        if frappe.db.exists("DocType", SERVICE_COMPONENT_DOCTYPE)
+        else []
+    )
+    return {
+        "company": company,
+        "results": results,
+        "tickets": [dict(row) for row in tickets],
+        "articles": [dict(row) for row in articles],
+        "service_status": [dict(row) for row in components],
+        "server_time": now_datetime(),
     }
 
 

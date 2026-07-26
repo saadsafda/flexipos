@@ -1,0 +1,32 @@
+{
+ "actions": [],
+ "autoname": "field:ticket_id",
+ "creation": "2026-07-26 00:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["ticket_id", "company", "submitted_by", "subject", "category", "priority", "description", "status", "resolution", "opened_at", "closed_at"],
+ "fields": [
+  {"fieldname": "ticket_id", "fieldtype": "Data", "hidden": 1, "label": "Ticket ID", "read_only": 1, "reqd": 1, "unique": 1},
+  {"fieldname": "company", "fieldtype": "Link", "in_list_view": 1, "in_standard_filter": 1, "label": "Company", "options": "Company", "read_only": 1, "reqd": 1},
+  {"fieldname": "submitted_by", "fieldtype": "Link", "in_standard_filter": 1, "label": "Submitted By", "options": "User", "read_only": 1, "reqd": 1},
+  {"fieldname": "subject", "fieldtype": "Data", "in_list_view": 1, "label": "Subject", "reqd": 1},
+  {"default": "General", "fieldname": "category", "fieldtype": "Select", "label": "Category", "options": "General\nBilling\nSales\nInventory\nRestaurant\nHardware\nAccount", "reqd": 1},
+  {"default": "Normal", "fieldname": "priority", "fieldtype": "Select", "in_list_view": 1, "label": "Priority", "options": "Low\nNormal\nHigh\nUrgent", "reqd": 1},
+  {"fieldname": "description", "fieldtype": "Small Text", "label": "Description", "reqd": 1},
+  {"default": "Open", "fieldname": "status", "fieldtype": "Select", "in_list_view": 1, "in_standard_filter": 1, "label": "Status", "options": "Open\nIn Progress\nWaiting on Customer\nResolved\nClosed", "reqd": 1},
+  {"fieldname": "resolution", "fieldtype": "Small Text", "label": "Resolution"},
+  {"fieldname": "opened_at", "fieldtype": "Datetime", "in_list_view": 1, "label": "Opened At", "read_only": 1, "reqd": 1},
+  {"fieldname": "closed_at", "fieldtype": "Datetime", "label": "Closed At", "read_only": 1}
+ ],
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-07-26 00:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "Flexipos",
+ "name": "FlexiPOS Support Ticket",
+ "owner": "Administrator",
+ "permissions": [{"create": 1, "read": 1, "report": 1, "write": 1, "role": "System Manager"}],
+ "sort_field": "opened_at",
+ "sort_order": "DESC",
+ "states": []
+}

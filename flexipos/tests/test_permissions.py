@@ -11,10 +11,22 @@ from uuid import uuid4
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from flexipos import api, security
+from flexipos import api, security, tasks
 
 
 class TestSecurityHeaders(FrappeTestCase):
+    def test_health_probe_exposes_no_tenant_or_secret_data(self):
+        with patch.object(
+            api,
+            "now_datetime",
+            return_value=frappe.utils.get_datetime("2026-07-26 10:00:00"),
+        ):
+            result = api.health()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["offline_pos_supported"])
+        self.assertNotIn("company", result)
+        self.assertNotIn("key", json.dumps(result).lower())
+
     def test_https_security_headers_are_added_to_responses(self):
         security.add_security_headers()
 
@@ -154,9 +166,76 @@ class TestSaaSOperatorPortal(FrappeTestCase):
         self.assertIn("flexipos.api.saas_list_tenants", script)
         self.assertIn("flexipos.api.saas_extend_trial", script)
         self.assertIn("flexipos.api.saas_set_tenant_status", script)
+        self.assertIn("FlexiPOS Billing Invoice", script)
+        self.assertIn("FlexiPOS Support Ticket", script)
+        self.assertIn("FlexiPOS Knowledge Article", script)
+        self.assertIn("FlexiPOS Service Component", script)
         self.assertNotIn("secret_api_key", script)
         self.assertNotIn("webhook_secret", script)
         self.assertIn('frappe.set_route("flexipos-saas-console")', settings_script)
+
+    def test_operations_dashboard_returns_only_aggregate_product_metrics(self):
+        def count(doctype, filters=None):
+            filters = filters or {}
+            if doctype == "Company" and not filters:
+                return 10
+            if doctype == "Company":
+                status = filters.get(api.SUBSCRIPTION_STATUS_FIELD)
+                return {
+                    "Active": 4,
+                    "Trialing": 2,
+                    "Past Due": 2,
+                    "Cancelled": 2,
+                    "Suspended": 0,
+                }.get(status, 3)
+            if doctype == "Sales Invoice":
+                return 25
+            if doctype == api.SUPPORT_TICKET_DOCTYPE:
+                return 3
+            return 1
+
+        with (
+            patch.object(api, "_require_saas_operator") as require_operator,
+            patch.object(
+                api,
+                "now_datetime",
+                return_value=frappe.utils.get_datetime("2026-07-26 10:00:00"),
+            ),
+            patch.object(
+                api,
+                "_get_saas_settings",
+                return_value=frappe._dict(
+                    terms_url="https://example.com/terms",
+                    privacy_url="https://example.com/privacy",
+                    retention_policy_url="https://example.com/retention",
+                    terms_version="1.0",
+                    privacy_version="1.0",
+                    retention_policy_version="1.0",
+                    legal_review_status="Approved",
+                    tax_review_status="Approved",
+                ),
+            ),
+            patch.object(frappe.db, "exists", return_value=True),
+            patch.object(frappe.db, "count", side_effect=count),
+            patch.object(
+                frappe, "get_all", return_value=["Company A", "Company B"]
+            ),
+        ):
+            result = api.saas_operations_dashboard()
+
+        require_operator.assert_called_once()
+        self.assertEqual(result["tenants"]["total"], 10)
+        self.assertEqual(result["tenants"]["conversion_percent"], 50.0)
+        self.assertEqual(result["product"]["selling_tenants_30d"], 2)
+        self.assertEqual(result["product"]["completed_sales_30d"], 25)
+        self.assertTrue(
+            result["launch_readiness"]["policy_links_configured"]
+        )
+        self.assertEqual(
+            result["launch_readiness"]["legal_review_status"], "Approved"
+        )
+        self.assertNotIn("customer", json.dumps(result).lower())
+        self.assertNotIn("revenue", result["product"])
 
 
 class TestSubscriptionLifecycle(FrappeTestCase):
@@ -527,6 +606,315 @@ class TestSubscriptionLifecycle(FrappeTestCase):
                 "https://example.com/success",
                 "https://example.com/cancel",
             )
+
+
+class TestBillingOperations(FrappeTestCase):
+    def test_production_billing_is_gated_by_recorded_legal_reviews(self):
+        incomplete = frappe._dict(
+            sandbox_mode=0,
+            terms_url="https://example.com/terms",
+            privacy_url="https://example.com/privacy",
+            retention_policy_url="https://example.com/retention",
+            terms_version="1.0",
+            privacy_version="1.0",
+            retention_policy_version="1.0",
+            legal_review_status="Pending",
+            tax_review_status="Approved",
+        )
+        with self.assertRaisesRegex(
+            frappe.ValidationError, "Legal and tax reviews"
+        ):
+            api._require_production_launch_readiness(incomplete)
+
+        incomplete.legal_review_status = "Approved"
+        api._require_production_launch_readiness(incomplete)
+
+    def test_policy_acceptance_is_versioned_and_idempotent(self):
+        settings = frappe._dict(terms_version="1.2", privacy_version="2.0")
+        document = MagicMock()
+        fixed_now = frappe.utils.get_datetime("2026-07-26 10:00:00")
+        with (
+            patch.object(frappe.db, "exists", side_effect=[True, False]),
+            patch.object(api, "now_datetime", return_value=fixed_now),
+            patch.object(frappe, "get_doc", return_value=document) as get_doc,
+        ):
+            acceptance_id = api._record_policy_acceptance(
+                "Company A", "Billing checkout", settings
+            )
+
+        values = get_doc.call_args.args[0]
+        self.assertEqual(values["acceptance_id"], acceptance_id)
+        self.assertEqual(values["terms_version"], "1.2")
+        self.assertEqual(values["privacy_version"], "2.0")
+        document.insert.assert_called_once_with(ignore_permissions=True)
+
+        with (
+            patch.object(frappe.db, "exists", side_effect=[True, True]),
+            patch.object(frappe, "get_doc") as duplicate_get_doc,
+        ):
+            duplicate = api._record_policy_acceptance(
+                "Company A", "Billing checkout", settings
+            )
+        self.assertEqual(duplicate, acceptance_id)
+        duplicate_get_doc.assert_not_called()
+
+    def test_verified_invoice_metadata_is_recorded_without_payment_secrets(self):
+        document = MagicMock()
+        payload = {
+            "invoice": {
+                "invoice_id": "invoice-123",
+                "amount": "1250.555",
+                "currency": "pkr",
+                "hosted_invoice_url": "https://pay.example/invoice-123",
+            },
+            "card_number": "must-not-be-persisted",
+        }
+        fixed_now = frappe.utils.get_datetime("2026-07-26 10:00:00")
+        with (
+            patch.object(frappe.db, "exists", side_effect=[True, False]),
+            patch.object(api, "now_datetime", return_value=fixed_now),
+            patch.object(frappe, "get_doc", return_value=document) as get_doc,
+        ):
+            result = api._record_billing_invoice(
+                "Company A",
+                "Safepay",
+                "event-123",
+                payload,
+                plan="monthly",
+                status="Paid",
+            )
+
+        self.assertEqual(result, "invoice-123")
+        values = get_doc.call_args.args[0]
+        self.assertEqual(values["company"], "Company A")
+        self.assertEqual(values["amount_minor"], 125056)
+        self.assertEqual(values["currency"], "PKR")
+        self.assertEqual(
+            values["hosted_url"], "https://pay.example/invoice-123"
+        )
+        self.assertNotIn("card_number", values)
+        document.insert.assert_called_once_with(ignore_permissions=True)
+
+    def test_tenant_invoice_endpoint_filters_by_authenticated_company(self):
+        rows = [
+            frappe._dict(
+                invoice_id="invoice-a",
+                company="Company A",
+                amount_minor=1000,
+            )
+        ]
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_require_admin") as require_admin,
+            patch.object(frappe.db, "exists", return_value=True),
+            patch.object(frappe, "get_all", return_value=rows) as get_all,
+        ):
+            result = api.get_billing_invoices()
+
+        require_admin.assert_called_once_with("Company A")
+        self.assertEqual(result["company"], "Company A")
+        self.assertEqual(result["invoices"][0]["invoice_id"], "invoice-a")
+        self.assertEqual(
+            get_all.call_args.kwargs["filters"], {"company": "Company A"}
+        )
+
+    def test_billing_notice_queue_is_idempotent(self):
+        document = MagicMock()
+        settings = frappe._dict(billing_email_enabled=1)
+        fixed_now = frappe.utils.get_datetime("2026-07-26 10:00:00")
+        with (
+            patch.object(tasks, "_payment_gateway_disabled", return_value=False),
+            patch.object(tasks, "_get_saas_settings", return_value=settings),
+            patch.object(tasks, "now_datetime", return_value=fixed_now),
+            patch.object(
+                frappe.db,
+                "exists",
+                side_effect=[True, False],
+            ),
+            patch.object(
+                frappe.db,
+                "get_value",
+                return_value="Owner@Example.com",
+            ),
+            patch.object(frappe, "get_doc", return_value=document) as get_doc,
+            patch.object(frappe, "enqueue") as enqueue,
+        ):
+            notice_key = tasks.queue_billing_notice(
+                "Company A", "payment_failed", event_id="event-1"
+            )
+
+        values = get_doc.call_args.args[0]
+        self.assertEqual(values["notice_key"], notice_key)
+        self.assertEqual(values["recipient"], "owner@example.com")
+        document.insert.assert_called_once_with(ignore_permissions=True)
+        enqueue.assert_called_once_with(
+            "flexipos.tasks.send_billing_notice",
+            notice_key=notice_key,
+            enqueue_after_commit=True,
+        )
+
+        with (
+            patch.object(tasks, "_payment_gateway_disabled", return_value=False),
+            patch.object(tasks, "_get_saas_settings", return_value=settings),
+            patch.object(frappe.db, "exists", side_effect=[True, True]),
+            patch.object(
+                frappe.db,
+                "get_value",
+                return_value="owner@example.com",
+            ),
+            patch.object(frappe, "get_doc") as duplicate_get_doc,
+            patch.object(frappe, "enqueue") as duplicate_enqueue,
+        ):
+            duplicate = tasks.queue_billing_notice(
+                "Company A", "payment_failed", event_id="event-1"
+            )
+
+        self.assertEqual(duplicate, notice_key)
+        duplicate_get_doc.assert_not_called()
+        duplicate_enqueue.assert_not_called()
+
+    def test_billing_notice_delivery_records_success(self):
+        notice = MagicMock(
+            name="notice-1",
+            status="Pending",
+            company="Company A",
+            kind="payment_succeeded",
+            recipient="owner@example.com",
+            attempts=0,
+        )
+        notice.name = "notice-1"
+        settings = frappe._dict(
+            billing_support_email="help@example.com",
+            billing_portal_url="https://billing.example.com",
+        )
+        fixed_now = frappe.utils.get_datetime("2026-07-26 10:00:00")
+        with (
+            patch.object(frappe, "get_doc", return_value=notice),
+            patch.object(
+                frappe.db, "get_value", return_value="Company A Retail"
+            ),
+            patch.object(tasks, "_get_saas_settings", return_value=settings),
+            patch.object(tasks, "now_datetime", return_value=fixed_now),
+            patch.object(frappe, "sendmail") as sendmail,
+        ):
+            result = tasks.send_billing_notice("notice-1")
+
+        self.assertEqual(result["status"], "Sent")
+        sendmail.assert_called_once()
+        sent = sendmail.call_args.kwargs
+        self.assertEqual(sent["recipients"], ["owner@example.com"])
+        self.assertIn("Payment confirmed", sent["subject"])
+        self.assertIn("https://billing.example.com", sent["message"])
+        notice.db_set.assert_called_once()
+        self.assertEqual(notice.db_set.call_args.args[0]["status"], "Sent")
+
+    def test_failed_payment_reminders_use_the_fixed_retry_schedule(self):
+        companies = [
+            frappe._dict(
+                name="Company A",
+                flexipos_current_period_end="2026-07-23 00:00:00",
+                flexipos_trial_ends_on=None,
+            ),
+            frappe._dict(
+                name="Company B",
+                flexipos_current_period_end="2026-07-24 00:00:00",
+                flexipos_trial_ends_on=None,
+            ),
+        ]
+        with (
+            patch.object(tasks, "_payment_gateway_disabled", return_value=False),
+            patch.object(
+                tasks,
+                "now_datetime",
+                return_value=frappe.utils.get_datetime("2026-07-26 10:00:00"),
+            ),
+            patch.object(frappe, "get_all", return_value=companies),
+            patch.object(tasks, "queue_billing_notice") as queue_notice,
+        ):
+            tasks._send_failed_payment_reminders()
+
+        queue_notice.assert_called_once_with(
+            "Company A",
+            "payment_reminder",
+            event_id="overdue-day-3:2026-07-26",
+        )
+
+
+class TestSupportOperations(FrappeTestCase):
+    def test_offline_ticket_sync_is_tenant_scoped_and_returns_public_help(self):
+        ticket_document = MagicMock()
+        fixed_now = frappe.utils.get_datetime("2026-07-26 10:00:00")
+        incoming = json.dumps(
+            [
+                {
+                    "id": "ticket-123",
+                    "subject": "Printer offline",
+                    "category": "Hardware",
+                    "priority": "High",
+                    "description": "The receipt printer is disconnected.",
+                }
+            ]
+        )
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(api, "_effective_role", return_value=api.ADMIN_ROLE),
+            patch.object(api, "now_datetime", return_value=fixed_now),
+            patch.object(
+                frappe.db,
+                "exists",
+                side_effect=[True, False, True, True, True],
+            ),
+            patch.object(
+                frappe, "get_doc", return_value=ticket_document
+            ) as get_doc,
+            patch.object(
+                frappe,
+                "get_all",
+                side_effect=[
+                    [frappe._dict(id="ticket-123", status="Open")],
+                    [frappe._dict(id="offline", title="Working offline")],
+                    [
+                        frappe._dict(
+                            id="sync",
+                            label="Cloud sync",
+                            status="Operational",
+                        )
+                    ],
+                ],
+            ) as get_all,
+        ):
+            result = api.sync_support(incoming)
+
+        values = get_doc.call_args.args[0]
+        self.assertEqual(values["company"], "Company A")
+        self.assertEqual(values["submitted_by"], frappe.session.user)
+        self.assertNotIn("company", json.loads(incoming)[0])
+        ticket_document.insert.assert_called_once_with(ignore_permissions=True)
+        self.assertEqual(result["results"][0]["status"], "success")
+        self.assertEqual(result["articles"][0]["title"], "Working offline")
+        self.assertEqual(result["service_status"][0]["status"], "Operational")
+        self.assertEqual(
+            get_all.call_args_list[0].kwargs["filters"],
+            {"company": "Company A"},
+        )
+
+    def test_support_ticket_id_cannot_cross_tenant_boundaries(self):
+        incoming = json.dumps(
+            [
+                {
+                    "id": "shared-ticket-id",
+                    "subject": "Question",
+                    "description": "Please help with this account.",
+                }
+            ]
+        )
+        with (
+            patch.object(api, "_get_user_company", return_value="Company A"),
+            patch.object(frappe.db, "exists", side_effect=[True, True]),
+            patch.object(frappe.db, "get_value", return_value="Company B"),
+            self.assertRaises(frappe.PermissionError),
+        ):
+            api.sync_support(incoming)
 
 
 class TestTenantOwnership(FrappeTestCase):
@@ -1217,6 +1605,7 @@ class TestEndpointPermissionContract(FrappeTestCase):
     """Prevent future endpoints from accidentally losing their API guard."""
 
     account_lifecycle_endpoints: ClassVar[set[str]] = {
+        "health",
         "register_business",
         "get_my_business",
         "get_device_token",
@@ -1233,11 +1622,14 @@ class TestEndpointPermissionContract(FrappeTestCase):
         "billing_webhook",
         "billing_checkout_return",
         "safepay_webhook",
+        "get_billing_invoices",
+        "sync_support",
         "request_data_export",
         "request_data_deletion",
         "request_account_deletion",
         "cancel_data_deletion",
         "saas_list_tenants",
+        "saas_operations_dashboard",
         "saas_set_default_trial_days",
         "saas_extend_trial",
         "saas_set_tenant_status",
